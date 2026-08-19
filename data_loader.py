@@ -7,9 +7,18 @@ Spike times come from the SpikeDetekt/KlustaKwik `.kwik` file, which covers a
 single concatenated recording of 13 experiments (experiment 9 was interrupted
 and excluded, hence the "not9" filename).  The `lims` array in the manifest
 `.mat` gives the length of each segment in 30 kHz samples; its cumulative sum
-maps spike sample indices back to individual experiment timelines.  Per-
-experiment `Timeline.mat` files supply stimulus onset and offset times in
-experiment-local seconds via mpepUDP event strings.
+maps spike sample indices back to individual experiment timelines.
+
+Stimulus timing comes from the **laser TTL markers on the Blackrock `.ns5`
+analog inputs** (see `laser_timing.py`), NOT from `Timeline.mat`.  Timeline's
+`mpepUDP` StimStart times live in a separate DAQ clock that is offset from the
+Blackrock clock by seconds, so aligning spikes to them scrambles every trial
+(flat PSTHs).  The `.ns5` analog TTLs are recorded in the *same* 30 kHz clock as
+the spikes, so their onsets map to concatenated-recording space with the same
+`exp_start` offset the spikes use — no cross-clock conversion.  `Timeline.mat`
+and `Protocol.mat` are still used, but only to label *what* each trial was:
+each measured laser onset is matched to a Timeline trial by relative timing, and
+that trial's `cond_id` is looked up in `Protocol.mat`.
 
 Two public functions
 --------------------
@@ -29,7 +38,8 @@ get_population_responses()
     time of its filtered waveform (from the .kwx file).  This is an
     approximation of the paper's clusterless method, which additionally
     denoised each spike via locality-sensitive hashing before measuring
-    waveform features.
+    waveform features.  (Which laser drove a trial is irrelevant to this split —
+    the E/I population signal is read off spike waveforms, not the stimulus.)
 
     Experiment types returned (keys in output dict):
       'single_E'   BB pulse, intT = 0  (single blue/excitatory pulse)
@@ -42,8 +52,12 @@ get_population_responses()
 
 Caveats
 -------
-- The fine-grained "chrono" synchronisation between the Timeline and Blackrock
-  clocks is not applied; residual drift is typically < 1 ms / 1000 s.
+- Onsets are matched to Timeline trials by relative timing; the residual (the
+  small Timeline/Blackrock clock drift) is < ~50 ms and does not affect the
+  onset itself, which comes from the analog TTL.  Some Timeline trials produce
+  no analog TTL (in exp 5, 10 of 30 single_E did), so the number of returned
+  trials can be slightly less than the Timeline trial count; those trials are
+  simply dropped.
 - The trough-to-peak threshold for E/I classification (default 0.4 ms) should
   be validated by inspecting the bimodal waveform-width distribution for each
   session; pass ei_threshold_ms to override.
@@ -58,6 +72,8 @@ import h5py
 import numpy as np
 import scipy.io
 from scipy.signal import windows as signal_windows
+
+import laser_timing
 
 SAMPLE_RATE_HZ: int = 30_000  # Blackrock / kwik spike-sample rate
 SERIES: int = 1               # always 1 for this animal/session
@@ -104,7 +120,7 @@ def _find_session_files(
 def _load_kwik_spikes(
     kwik_path: Path,
     min_cluster_group: int = 1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict]]:
+) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """
     Load spike times and cluster assignments from a kwik (HDF5) file.
 
@@ -186,6 +202,11 @@ def _parse_timeline_trials(timeline_path: Path) -> list[dict]:
     Returns a list of trial dicts with keys:
         onset_s, offset_s, exp, block, cond_id
     Times are in seconds relative to Timeline DAQ start (t = 0).
+
+    NOTE: onset_s is in the *Timeline* clock, which is offset from the Blackrock
+    spike clock — it is used only as a per-trial ordering / relative-timing key
+    to match against the analog laser onsets, never as an absolute spike-aligned
+    time.  See the module docstring.
     """
     mat = scipy.io.loadmat(str(timeline_path), squeeze_me=True, struct_as_record=False)
     tl = mat["Timeline"]
@@ -223,6 +244,133 @@ def _parse_timeline_trials(timeline_path: Path) -> list[dict]:
     return trials
 
 
+def _match_onsets_to_timeline(
+    onsets: np.ndarray,
+    trials: list[dict],
+    tol_s: float = 1.0,
+) -> list[tuple[int, dict]]:
+    """
+    Match measured laser onsets (Blackrock samples) to Timeline trials.
+
+    The two clocks share the same rate to within negligible drift over one
+    experiment, so a matching analog onset and Timeline trial differ by a
+    constant time shift.  We anchor the first analog onset to whichever of the
+    first few Timeline trials maximises the number of consistent matches (robust
+    to a missing pulse at the start), then assign each onset to its nearest
+    Timeline trial under that shift.
+
+    Returns (onset_sample, trial) pairs, sorted by onset, for onsets that matched
+    a trial within `tol_s`.
+    """
+    if onsets.size == 0 or not trials:
+        return []
+
+    a = onsets.astype(np.float64) / SAMPLE_RATE_HZ
+    b = np.array([t["onset_s"] for t in trials], dtype=np.float64)
+
+    best_nearest: np.ndarray | None = None
+    best_resid: np.ndarray | None = None
+    best_score = -1
+    for j0 in range(min(8, b.size)):
+        shift = a[0] - b[j0]
+        nearest = np.abs((b[np.newaxis, :] + shift) - a[:, np.newaxis]).argmin(axis=1)
+        resid = np.abs(b[nearest] + shift - a)
+        score = int(np.sum(resid < tol_s))
+        if score > best_score:
+            best_score, best_nearest, best_resid = score, nearest, resid
+
+    # Assign, keeping the closest onset when two map to the same trial.
+    chosen: dict[int, tuple[int, float]] = {}
+    for i in range(a.size):
+        if best_resid[i] >= tol_s:
+            continue
+        j = int(best_nearest[i])
+        if j not in chosen or best_resid[i] < chosen[j][1]:
+            chosen[j] = (i, float(best_resid[i]))
+
+    matches = [(int(onsets[i]), trials[j]) for j, (i, _) in chosen.items()]
+    matches.sort(key=lambda m: m[0])
+    return matches
+
+
+def _load_experiment_trials(
+    session_dir: Path,
+    exp_num: int,
+    animal_id: str,
+    iti_gap_s: float = 1.0,
+) -> list[dict]:
+    """
+    Trials for one experiment: measured laser onset + condition label.
+
+    Combines the analog-TTL onsets (timing, Blackrock samples, experiment-local)
+    with the matched Timeline trial and its Protocol condition (labels).  Returns
+    an empty list for experiments with no detectable laser pulses (e.g. visual
+    tuning experiments), which cannot be aligned by this method.
+
+    Each returned dict has:
+        onset_sample : int   experiment-local Blackrock sample of the first pulse
+        exp, block, cond_id
+        pulse_type, ipi_ms, dur_ms, exp_type   (from Protocol)
+    """
+    ns5 = laser_timing.find_ns5(session_dir, exp_num, animal_id)
+    if ns5 is None:
+        return []
+    onsets = laser_timing.experiment_trial_onsets(ns5, iti_gap_s=iti_gap_s)
+    if onsets.size == 0:
+        return []
+
+    timeline_path = session_dir / str(exp_num) / f"1_{exp_num}_{animal_id}_Timeline.mat"
+    protocol_path = session_dir / str(exp_num) / "Protocol.mat"
+    if not timeline_path.exists() or not protocol_path.exists():
+        return []
+
+    trials = _parse_timeline_trials(timeline_path)
+    if not trials:
+        return []
+    cond_map = _load_protocol_conditions(protocol_path)
+
+    out: list[dict] = []
+    for onset_sample, trial in _match_onsets_to_timeline(onsets, trials):
+        cond = cond_map.get(trial["cond_id"])
+        if cond is None:
+            continue   # pulse type we don't model
+        out.append(
+            dict(
+                onset_sample=int(onset_sample),
+                exp=int(exp_num),
+                block=trial["block"],
+                cond_id=trial["cond_id"],
+                pulse_type=cond["pulse_type"],
+                ipi_ms=cond["ipi_ms"],
+                dur_ms=cond["dur_ms"],
+                exp_type=cond["exp_type"],
+            )
+        )
+    return out
+
+
+def _pulse_mask(trial: dict, n_bins: int, pre_s: float, bin_s: float) -> np.ndarray:
+    """
+    Binary laser-on indicator for one trial, from Protocol pulse timing.
+
+    The pulse(s) are anchored at the measured onset (bin for t = 0) using the
+    intended duration and interpulse interval from Protocol.
+    """
+    s = np.zeros(n_bins, dtype=np.float32)
+    dur_s = trial["dur_ms"] / 1000.0
+
+    def mark(t0_s: float) -> None:
+        lo = int(round((pre_s + t0_s) / bin_s))
+        hi = int(round((pre_s + t0_s + dur_s) / bin_s))
+        hi = max(hi, lo + 1)   # a sub-bin pulse (< bin_s) still marks one bin
+        s[max(lo, 0):min(hi, n_bins)] = 1.0
+
+    mark(0.0)
+    if trial["ipi_ms"] > 0:
+        mark(trial["ipi_ms"] / 1000.0)
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -258,19 +406,23 @@ def load_data(
         Default 1 keeps everything except noise.
     selected_exps : list of int, optional
         Restrict to these experiment numbers (1-indexed, matching the log file).
-        None (default) loads all experiments in the manifest.
+        None (default) loads every experiment in the manifest; those without
+        detectable laser pulses (e.g. visual tuning experiments) are skipped,
+        because trial alignment here relies on the laser TTL.
 
     Returns
     -------
     responses : ndarray, shape (n_trials, n_units, n_bins), float32
         Spike counts per bin.  Units are ordered by (channel_group, cluster_id).
     stimulus : ndarray, shape (n_trials, n_bins), float32
-        Binary laser-on indicator constructed from StimStart / StimEnd events.
-        1 during the trial epoch, 0 before onset and after offset.
+        Binary laser-on indicator built from the Protocol pulse timing, anchored
+        at the measured onset.  1 during each laser pulse, 0 otherwise.
     time_axis : ndarray, shape (n_bins,), float64
         Bin centres in seconds relative to stimulus onset (negative = pre).
     trial_info : list of dicts, length n_trials
-        Per-trial metadata: exp, block, cond_id, onset_s, offset_s.
+        Per-trial metadata: exp, block, cond_id, onset_s (experiment-local
+        seconds), onset_sample (concatenated Blackrock sample), pulse_type,
+        ipi_ms, dur_ms, exp_type.
     unit_info : list of dicts, length n_units
         Per-unit metadata: channel_group, cluster_id, cluster_group, unit_idx.
 
@@ -327,16 +479,9 @@ def load_data(
         if not exp_mask[exp_i]:
             continue
 
-        timeline_path = (
-            session_dir / str(exp_num) / f"1_{exp_num}_{animal_id}_Timeline.mat"
-        )
-        if not timeline_path.exists():
-            print(f"  exp {exp_num}: Timeline not found, skipping")
-            continue
-
-        trials = _parse_timeline_trials(timeline_path)
+        trials = _load_experiment_trials(session_dir, int(exp_num), animal_id)
         if not trials:
-            print(f"  exp {exp_num}: no StimStart/StimEnd events, skipping")
+            print(f"  exp {exp_num}: no laser trials, skipping")
             continue
 
         print(f"  exp {exp_num}: {len(trials)} trials")
@@ -345,12 +490,9 @@ def load_data(
         exp_end = exp_start_samples[exp_i + 1]
 
         for trial in trials:
-            onset_s: float = trial["onset_s"]
-            offset_s: float = trial.get("offset_s", onset_s + post_s)
-            stim_dur_s: float = offset_s - onset_s
-
-            win_start_sample = exp_start + int((onset_s - pre_s) * SAMPLE_RATE_HZ)
-            win_end_sample = exp_start + int((onset_s + post_s) * SAMPLE_RATE_HZ)
+            onset_sample = exp_start + trial["onset_sample"]
+            win_start_sample = onset_sample - int(pre_s * SAMPLE_RATE_HZ)
+            win_end_sample = onset_sample + int(post_s * SAMPLE_RATE_HZ)
 
             # Clamp to experiment boundaries
             win_start_sample = max(win_start_sample, exp_start)
@@ -358,7 +500,6 @@ def load_data(
 
             # --- responses: (n_units, n_bins) --------------------------------
             r = np.zeros((n_units, n_bins), dtype=np.float32)
-            onset_sample = exp_start + int(onset_s * SAMPLE_RATE_HZ)
 
             for uid, st in enumerate(unit_spike_samples):
                 lo = int(np.searchsorted(st, win_start_sample))
@@ -374,20 +515,20 @@ def load_data(
 
             all_responses.append(r)
 
-            # --- stimulus: binary laser-on indicator -------------------------
-            s = np.zeros(n_bins, dtype=np.float32)
-            t0_bin = int(round(pre_s / bin_s))
-            t1_bin = int(round((pre_s + stim_dur_s) / bin_s))
-            s[t0_bin : min(t1_bin, n_bins)] = 1.0
-            all_stimuli.append(s)
+            # --- stimulus: binary laser-on indicator from Protocol -----------
+            all_stimuli.append(_pulse_mask(trial, n_bins, pre_s, bin_s))
 
             all_trial_info.append(
                 dict(
-                    exp=int(exp_num),
+                    exp=trial["exp"],
                     block=trial["block"],
                     cond_id=trial["cond_id"],
-                    onset_s=onset_s,
-                    offset_s=offset_s,
+                    onset_s=trial["onset_sample"] / SAMPLE_RATE_HZ,
+                    onset_sample=int(onset_sample),
+                    pulse_type=trial["pulse_type"],
+                    ipi_ms=trial["ipi_ms"],
+                    dur_ms=trial["dur_ms"],
+                    exp_type=trial["exp_type"],
                 )
             )
 
@@ -504,10 +645,15 @@ def _load_protocol_conditions(protocol_path: Path) -> dict[int, dict]:
     """
     Parse Protocol.mat and return a mapping:
         cond_id (1-indexed) → {pulse_type, ipi_ms, dur_ms, exp_type}
+
+    Returns an empty dict for non-TTL protocols (visual / regular-pulse), which
+    have no `pulseType` parameter.
     """
     mat = scipy.io.loadmat(str(protocol_path), squeeze_me=True, struct_as_record=False)
     p = mat["Protocol"]
     parnames = list(p.parnames)
+    if "pulseType" not in parnames:
+        return {}
     pars = p.pars  # (n_params, n_conditions)
 
     pt_idx = parnames.index("pulseType")
@@ -655,42 +801,20 @@ def get_population_responses(
         if exp_num not in selected_exps:
             continue
 
-        protocol_path = session_dir / str(exp_num) / "Protocol.mat"
-        timeline_path = session_dir / str(exp_num) / f"1_{exp_num}_{animal_id}_Timeline.mat"
-
-        if not protocol_path.exists() or not timeline_path.exists():
-            print(f"  exp {exp_num}: missing Protocol or Timeline, skipping")
-            continue
-
-        # Skip non-TTL protocols (visual / regular pulse)
-        p_mat = scipy.io.loadmat(str(protocol_path), squeeze_me=True, struct_as_record=False)
-        proto = p_mat["Protocol"]
-        if "pulseType" not in list(proto.parnames):
-            print(f"  exp {exp_num}: no pulseType parameter ({proto.xfile}), skipping")
-            continue
-
-        cond_map = _load_protocol_conditions(protocol_path)
-        trials = _parse_timeline_trials(timeline_path)
+        trials = _load_experiment_trials(session_dir, int(exp_num), animal_id)
         if not trials:
+            print(f"  exp {exp_num}: no laser trials, skipping")
             continue
 
         exp_start = exp_start_samples[exp_i]
         exp_end   = exp_start_samples[exp_i + 1]
-        print(f"  exp {exp_num}: {len(trials)} trials ({proto.xfile})")
+        print(f"  exp {exp_num}: {len(trials)} trials")
 
         for trial in trials:
-            cond_id = trial["cond_id"]
-            if cond_id not in cond_map:
-                continue
-            cparams = cond_map[cond_id]
-            exp_type = cparams["exp_type"]
-
-            onset_s = trial["onset_s"]
-            win_start = exp_start + int((onset_s - pre_s) * SAMPLE_RATE_HZ)
-            win_end   = exp_start + int((onset_s + post_s) * SAMPLE_RATE_HZ)
-            win_start = max(win_start, exp_start)
-            win_end   = min(win_end,   exp_end)
-            onset_sample = exp_start + int(onset_s * SAMPLE_RATE_HZ)
+            exp_type = trial["exp_type"]
+            onset_sample = exp_start + trial["onset_sample"]
+            win_start = max(onset_sample - int(pre_s * SAMPLE_RATE_HZ), exp_start)
+            win_end   = min(onset_sample + int(post_s * SAMPLE_RATE_HZ), exp_end)
 
             counts = np.zeros((2, n_bins), dtype=np.float32)
             for pop_idx, st in enumerate((e_times, i_times)):
@@ -703,7 +827,7 @@ def get_population_responses(
                     np.add.at(counts[pop_idx], bin_idx[valid], 1.0)
 
             # Condition key used to group trials: (pulse_type, ipi_ms, dur_ms)
-            ckey = (cparams["pulse_type"], cparams["ipi_ms"], cparams["dur_ms"])
+            ckey = (trial["pulse_type"], trial["ipi_ms"], trial["dur_ms"])
             accum.setdefault(exp_type, {}).setdefault(ckey, []).append(counts)
 
     # --- average, smooth, normalise -----------------------------------------
