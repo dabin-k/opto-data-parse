@@ -79,6 +79,9 @@ _MOUSE_LINE: dict[str, str] = {
 # ran the two-wavelength 2waves paired-pulse protocol, consistent with +C1V1).
 _MOUSE_ID_ALIASES: dict[str, str] = {
     "M150605_ICTP1": "M150605A",
+    "M150609_ICTP1": "M150609A",
+    # Add more session-dir -> Table S2 ID as they are verified.  The ICTP1 -> "A"
+    # correspondence is confirmed for these two; do not assume it for others.
 }
 
 

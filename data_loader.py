@@ -74,6 +74,7 @@ import scipy.io
 from scipy.signal import windows as signal_windows
 
 import laser_timing
+import mouse_lines
 
 SAMPLE_RATE_HZ: int = 30_000  # Blackrock / kwik spike-sample rate
 SERIES: int = 1               # always 1 for this animal/session
@@ -327,7 +328,7 @@ def _load_experiment_trials(
     trials = _parse_timeline_trials(timeline_path)
     if not trials:
         return []
-    cond_map = _load_protocol_conditions(protocol_path)
+    cond_map = _load_protocol_conditions(protocol_path, _wavelength_to_pop(animal_id))
 
     out: list[dict] = []
     for onset_sample, trial in _match_onsets_to_timeline(onsets, trials):
@@ -545,18 +546,48 @@ def load_data(
 # E / I population helpers
 # ---------------------------------------------------------------------------
 
-# Maps Protocol pulseType integer to (first_pop, second_pop) labels.
-# B = Blue = 445 nm → excitatory (E); G = Green = 561 nm → inhibitory (I).
-_PULSE_TYPE_MAP = {
-    1: ("E", "E"),   # BB
-    2: ("I", "I"),   # GG
-    3: ("E", "I"),   # BG
-    4: ("I", "E"),   # GB
+# Protocol pulseType integer → the two pulse wavelengths (nm).
+# B = Blue = 445 nm, G = Green = 561 nm.  These are physical constants; which
+# population each wavelength drives is mouse-line dependent (see mouse_lines.py).
+_PULSE_TYPE_WAVELENGTHS = {
+    1: (445, 445),   # BB
+    2: (561, 561),   # GG
+    3: (445, 561),   # BG
+    4: (561, 445),   # GB
 }
 
-# Experiment-type key derived from (first_pop, second_pop, is_paired).
-def _exp_type_key(pulse_type: int, ipi_ms: int) -> str:
-    first, second = _PULSE_TYPE_MAP[pulse_type]
+
+def _wavelength_to_pop(animal_id: str) -> dict[int, str]:
+    """
+    {wavelength_nm → 'E'|'I'} for this animal, from its mouse line.
+
+    e.g. PVcre;Thy18+C1V1 → {445: 'E', 561: 'I'};  PVcre;Ai32 → {445: 'I'}.
+    A wavelength that drives no opsin in this line is simply absent.
+    """
+    e_nm, i_nm = mouse_lines.mouse_wavelengths(animal_id)
+    wl: dict[int, str] = {}
+    if e_nm is not None:
+        wl[e_nm] = "E"
+    if i_nm is not None:
+        wl[i_nm] = "I"
+    return wl
+
+
+def _pulse_populations(pulse_type: int, wl_to_pop: dict[int, str]) -> tuple[str, str] | None:
+    """(first_pop, second_pop) for a pulseType, or None if a wavelength is not
+    drivable in this mouse line."""
+    w1, w2 = _PULSE_TYPE_WAVELENGTHS[pulse_type]
+    if w1 not in wl_to_pop or w2 not in wl_to_pop:
+        return None
+    return wl_to_pop[w1], wl_to_pop[w2]
+
+
+def _exp_type_key(pulse_type: int, ipi_ms: int, wl_to_pop: dict[int, str]) -> str | None:
+    """Experiment-type key ('single_E', 'paired_EI', …), or None if untargetable."""
+    pops = _pulse_populations(pulse_type, wl_to_pop)
+    if pops is None:
+        return None
+    first, second = pops
     if ipi_ms == 0:
         return f"single_{first}"
     return f"paired_{first}{second}"
@@ -641,13 +672,18 @@ def _load_population_spikes(
     return time_samples[order], ei_labels[order]
 
 
-def _load_protocol_conditions(protocol_path: Path) -> dict[int, dict]:
+def _load_protocol_conditions(
+    protocol_path: Path,
+    wl_to_pop: dict[int, str],
+) -> dict[int, dict]:
     """
     Parse Protocol.mat and return a mapping:
-        cond_id (1-indexed) → {pulse_type, ipi_ms, dur_ms, exp_type}
+        cond_id (1-indexed) → {pulse_type, ipi_ms, dur_ms, first_pop, second_pop, exp_type}
 
-    Returns an empty dict for non-TTL protocols (visual / regular-pulse), which
-    have no `pulseType` parameter.
+    `wl_to_pop` maps each pulse wavelength to E/I for this animal (see
+    `_wavelength_to_pop`).  Returns an empty dict for non-TTL protocols (visual /
+    regular-pulse), which have no `pulseType` parameter.  Conditions whose
+    wavelength drives no opsin in this mouse line are skipped.
     """
     mat = scipy.io.loadmat(str(protocol_path), squeeze_me=True, struct_as_record=False)
     p = mat["Protocol"]
@@ -666,13 +702,18 @@ def _load_protocol_conditions(protocol_path: Path) -> dict[int, dict]:
         pt = int(pars[pt_idx, cond_i])
         ipi_ms = int(pars[int_idx, cond_i])
         dur_ms = float(pars[dur_idx, cond_i]) / 10.0   # stored as ms*10
-        if pt not in _PULSE_TYPE_MAP:
+        if pt not in _PULSE_TYPE_WAVELENGTHS:
             continue
+        pops = _pulse_populations(pt, wl_to_pop)
+        if pops is None:
+            continue   # wavelength not drivable in this mouse line
         conditions[cond_id] = dict(
             pulse_type=pt,
             ipi_ms=ipi_ms,
             dur_ms=dur_ms,
-            exp_type=_exp_type_key(pt, ipi_ms),
+            first_pop=pops[0],
+            second_pop=pops[1],
+            exp_type=_exp_type_key(pt, ipi_ms, wl_to_pop),
         )
     return conditions
 
@@ -681,13 +722,44 @@ def _load_protocol_conditions(protocol_path: Path) -> dict[int, dict]:
 # Public API: population-level responses
 # ---------------------------------------------------------------------------
 
-#: Experiments to include by default (TTL pulse experiments only; excludes
-#: visual characterisation exps 1 & 14, and regular-pulse exps 8, 10–12).
+#: Example pulse-exp list for M150605 (single + paired opto).  The loader no
+#: longer hardcodes this — it derives the list per session via
+#: `_pulse_experiments`; kept only as a reference / for callers that want it.
 DEFAULT_PULSE_EXPS = [2, 3, 4, 5, 6, 7, 13]
+
+#: Protocol xfiles that are single/paired optogenetic pulse experiments (the E/I
+#: analysis subset).  Excludes regular-pulse trains (`stimRegPulsesWave`) and
+#: visual protocols (`ogl*`).
+_OPTO_PULSE_XFILES = {"stim2Pulses2Waves.x", "stim2PulsesRandNoise.x"}
 
 #: All valid experiment-type keys, in a canonical order.
 ALL_EXP_TYPES = ("single_E", "single_I", "paired_EE", "paired_II",
                  "paired_EI", "paired_IE", "flash")
+
+
+def _pulse_experiments(
+    session_dir: Path,
+    all_exps: list[int],
+    animal_id: str,
+) -> list[int]:
+    """
+    Optogenetic single/paired pulse experiments for a session, from Protocol.
+
+    Reads each experiment's `Protocol.mat` `xfile` and keeps those in
+    `_OPTO_PULSE_XFILES`.  Replaces the hardcoded, M150605-specific
+    `DEFAULT_PULSE_EXPS` so the loader works for any mouse's experiment layout.
+    """
+    out: list[int] = []
+    for exp_num in all_exps:
+        protocol_path = session_dir / str(exp_num) / "Protocol.mat"
+        if not protocol_path.exists():
+            continue
+        proto = scipy.io.loadmat(
+            str(protocol_path), squeeze_me=True, struct_as_record=False
+        )["Protocol"]
+        if str(getattr(proto, "xfile", "")) in _OPTO_PULSE_XFILES:
+            out.append(int(exp_num))
+    return out
 
 
 def get_population_responses(
@@ -717,9 +789,10 @@ def get_population_responses(
     base_dir : str or Path
     session : int
     selected_exps : list of int, optional
-        Experiment numbers to include.  Defaults to the TTL pulse experiments
-        [2, 3, 4, 5, 6, 7, 13].  Experiments 1 & 14 are visual tuning checks;
-        8, 10–12 are regular-pulse experiments with a different paradigm.
+        Experiment numbers to include.  Default (None) derives the single/paired
+        optogenetic pulse experiments for this session from each Protocol's xfile
+        (`_pulse_experiments`), so it adapts to each mouse's layout — visual
+        (`ogl*`) and regular-pulse (`stimRegPulsesWave`) experiments are excluded.
     pre_s, post_s : float
         Trial window around stimulus onset (seconds).
     bin_s : float
@@ -762,14 +835,15 @@ def get_population_responses(
         session_dir, animal_id, session
     )
 
-    if selected_exps is None:
-        selected_exps = DEFAULT_PULSE_EXPS
-
     # --- segment boundaries -------------------------------------------------
     manifest = scipy.io.loadmat(str(manifest_path), squeeze_me=True)
     lims: np.ndarray = manifest["lims"].astype(np.int64)
     all_exps: np.ndarray = manifest["SELECTED_EXPERIMENTS"].astype(int)
     exp_start_samples = np.concatenate([[0], np.cumsum(lims)])
+
+    if selected_exps is None:
+        selected_exps = _pulse_experiments(session_dir, list(all_exps), animal_id)
+        print(f"pulse experiments (from Protocol xfiles): {selected_exps}")
 
     # --- load population spike trains (E and I) -----------------------------
     print("Loading and classifying spikes …")
@@ -779,6 +853,8 @@ def get_population_responses(
     e_times = pop_times[pop_labels == 0]   # wide / excitatory
     i_times = pop_times[pop_labels == 1]   # narrow / inhibitory
     print(f"  {(pop_labels==0).sum():,} E spikes,  {(pop_labels==1).sum():,} I spikes")
+
+    wl_to_pop = _wavelength_to_pop(animal_id)   # for per-condition E/I labels
 
     # --- time axis and Hamming kernel ---------------------------------------
     n_bins = int(round((pre_s + post_s) / bin_s))
@@ -862,7 +938,7 @@ def get_population_responses(
 
             responses_list.append(normalised)
             pt, ipi, dur = ckey
-            first, second = _PULSE_TYPE_MAP[pt]
+            first, second = _pulse_populations(pt, wl_to_pop)
             cond_meta = dict(pulse_type=pt, ipi_ms=ipi, dur_ms=dur,
                              first_pop=first, second_pop=second)
             conditions_list.append(cond_meta)

@@ -71,6 +71,20 @@ Per-experiment dirs `…/1/<exp>/`:
 - `figures.py` — `plot_raw_traces_around_pulse()` reproduces Fig S1.B.
 - Run against miniconda **base** python. Needs the dataset mounted.
 
+## Cross-mouse (how much generalises)
+
+Checked on 2 mice so far: **M150605A** and **M150609A** (both `M15060x_ICTP1`). Not yet verified on the rest.
+
+Same across both (promising, unverified elsewhere):
+- `.ns5` = 36 ch = 32 neural + 4 analog (ids 129–132), **NEURALSG** format.
+- **Laser channels identical: `ain131` = E laser, `ain132` = I laser.**
+- Manifest `not*` + `lims` scheme; `lims` == `.ns5` lengths.
+
+Differs per mouse (must be handled, not hardcoded):
+- Excluded experiment differs (`not9` vs `not1`) → manifest filename differs. Handled by `*_not*` glob.
+- Experiment numbers / layout differ → **pulse-exp list is derived per session** from each `Protocol.mat` `xfile`, not hardcoded.
+- Mouse line differs → **wavelength→E/I map comes from `mouse_lines.py`**, not a fixed B→E. (M150609 happens to match M150605; other lines differ, e.g. `PVcre;Ai32` = 445→I only.)
+
 ## Known issues / uncertainties
 
 - **E/I waveform threshold** (0.4 ms) is unvalidated — current split is lopsided (~113k wide vs ~1.09M narrow). Needs the per-session bimodal-width check.
