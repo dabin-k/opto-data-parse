@@ -1,7 +1,7 @@
 # CLAUDE.md — Working conventions for this repo
 
 How Dabin and Claude collaborate on **ichun_opto**. Auto-loaded as context every session.
-A new agent should read this + `M150605_ICTP1_data_file_conjectures.md` + the latest
+A new agent should read this + `README.md` + the latest
 `journal/YYYY-MM-DD.md` and be caught up.
 
 ## What this project is
@@ -15,21 +15,15 @@ and inhibition in the mouse corticothalamic network"*, bioRxiv `2020.06.03.13268
 (PDF: `lin_harris_mouse_corticothalamic_dynamical_equation.pdf`). Awake mouse V1 was
 optogenetically stimulated with single and paired light pulses to drive excitatory (pyramidal)
 and/or PV-expressing inhibitory populations; activity was recorded extracellularly, with paired
-LGN recordings. **Which wavelength drives which population depends on the mouse line** — see the
-data-model section below; do not assume "blue = E".
+LGN recordings. 
 
-**Method of validation:** recreate figures from the paper (starting with Fig. 1C rasters) to
-*confirm* the raw data has been parsed correctly. A reproduced figure that matches the paper is
-the evidence that our reading of the file format is right. The deliverable is understanding, not
-a pipeline.
+**Method of validation:** recreate figures from the paper to *confirm* the raw data has been 
+parsed correctly. A reproduced figure that matches the paper is the evidence that our reading 
+of the file format is right. The deliverable is understanding, and then a pipeline.
 
 **Final aim (where this is heading):** make the loader driven by **mouse ID and experiment type**
 as first-class, easily-configured inputs, so any session in this dataset — not just the hardcoded
-`M150605_ICTP1` — can be loaded and its figures reproduced. The current `data_loader.py` hardcodes
-this one session (single `animal_id`, fixed wavelength→population map, `DEFAULT_PULSE_EXPS`, etc.).
-**We are not refactoring it yet** — this is the direction, stated here so new work bends toward
-generality (parameterise mouse/experiment rather than baking in M150605 assumptions) rather than
-away from it.
+`M150605_ICTP1` — can be loaded and its figures reproduced. 
 
 ## Where things live
 | Concern | Location |
@@ -38,9 +32,6 @@ away from it.
 | Session-level files | `/mnt/scratch/M150605_ICTP1/1/` (manifest `.mat`, `.kwik`, `.kwx`) |
 | Per-experiment files | `/mnt/scratch/M150605_ICTP1/1/<exp>/` (`Protocol.mat`, `*_Timeline.mat`, `.ns5`, `.nev`) |
 | Data-loading code | `data_loader.py` |
-| Standing notes on file formats & interpretations | `M150605_ICTP1_data_file_conjectures.md` |
-| Exploration / figure work | `scratch.ipynb` |
-| Reproduced figures | `fig1c_rasters.png` (and future `figNx_*.png`) |
 | The paper | `lin_harris_mouse_corticothalamic_dynamical_equation.pdf` |
 | Daily journal | `journal/YYYY-MM-DD.md` *(convention to adopt; dir not yet created)* |
 
@@ -53,18 +44,6 @@ No project virtualenv — run against base.
 **Dependencies:** `numpy`, `scipy`, `h5py`, `matplotlib` (all present in base). There is **no
 `requirements.txt`** yet — add one only if the user asks.
 
-## How to run
-The loader is a library, driven from `scratch.ipynb` or a REPL:
-```python
-import data_loader
-# Cluster-level trial-aligned spike counts: (n_trials, n_units, n_bins)
-responses, stimulus, time_axis, trial_info, unit_info = data_loader.load_data(bin_s=0.01)
-# Trial-averaged, baseline-normalised E/I population PSTHs, grouped by experiment type
-pop = data_loader.get_population_responses()
-```
-Requires `/mnt/scratch/M150605_ICTP1/` to be mounted. Reading `.ns5` continuous voltage is a
-last resort — prefer the already-detected spikes in `.kwik`.
-
 ## Git workflow
 - Working branch: **master** (repo has **no commits yet** — the first commit will establish it).
 - Don't push to anything other than `master` without confirming first.
@@ -74,54 +53,10 @@ last resort — prefer the already-detected spikes in `.kwik`.
   the first commit (at minimum `__pycache__/`).
 - Commit or push only when the user asks.
 
-## Conventions for this codebase
-
-### The data model we've inferred (see conjectures doc for full reasoning)
-- Spikes come from a **SpikeDetekt/KlustaKwik `.kwik`** (HDF5) file covering **13 concatenated
-  experiments** (experiment 9 was interrupted and excluded — hence the `not9` filename). Spike
-  times are **sample indices at 30 kHz**, in concatenated-recording space.
-- The manifest `.mat` (`..._s1_not9.mat` / `..._s1_V1.mat`) is a **preprocessing manifest**, not
-  a results file: `lims` (per-segment sample lengths, cumsum → segment boundaries),
-  `SELECTED_EXPERIMENTS`, `SELECTED_CHANNELS`, `CHANNELS_ORDER`.
-- Per-experiment `Timeline.mat` holds **measured** stimulus timing as `mpepUDP` `StimStart`/
-  `StimEnd` event strings (experiment-local seconds). `Protocol.mat` holds **intended** condition
-  parameters (`pulseType`, `intT` = interpulse interval, `durT` = duration×10). Align by event.
-- Pulse-type map: `1=BB`, `2=GG`, `3=BG`, `4=GB` (`intT==0` ⇒ single pulse). **Blue↔E / Green↔I
-  is mouse-line dependent** — see Table S1 of the paper:
-  - `Thy18`: ChR2 @ **445 nm** → **E** (pyramidal); no I opsin.
-  - `PVᶜʳᵉ;Ai32`: ChR2 @ **445 nm** → **I** (PV) — here blue drives inhibition, not excitation.
-  - `PVᶜʳᵉ;Thy18 + C1V1`: ChR2 @ **445 nm** → **E**, C1V1 @ **561 nm** → **I**.
-  - **This session (M150605A = `PVᶜʳᵉ;Thy18`+C1V1, per Table S2):** 445 nm (blue) → E,
-    561 nm (green) → I. So `data_loader._PULSE_TYPE_MAP` (`B→E, G→I`) is correct *for M150605*,
-    but it is a per-mouse-line assumption that must become configurable per the final aim above.
-- **E/I classification is clusterless in the paper**: each detected spike is labelled wide
-  (putative excitatory) vs narrow (fast-spiking inhibitory) by waveform trough-to-peak time, from
-  `.kwx` filtered waveforms. Our loader approximates this per-spike (paper additionally denoised
-  via locality-sensitive hashing over PCA features — not reimplemented). So the faithful V1
-  representation is `(trials, 2 populations, time)`, **not** `(trials, n_cells, time)`.
-- LGN used a *different* pipeline (KiloSort + Phy → pooled MUA); not the V1 E/I path.
-
-### Experiment layout for session 1 (from `scratch.ipynb` cell 8)
-- Exp 1, 14 — visual tuning checks (`oglTwoGratings` / `ogltuning`)
-- Exps 2, 3, 6, 7 — main paired-pulse optogenetic (`stim2PulsesRandNoise`)
-- Exps 4, 5, 13 — single-pulse optogenetic (`stim2Pulses2Waves`)
-- Exps 8, 10–12 — regular periodic pulses (`stimRegPulsesWave`)
-- `DEFAULT_PULSE_EXPS = [2,3,4,5,6,7,13]` is the TTL-pulse subset used for E/I analysis.
-
 ### Style
 - Match `data_loader.py`: module-level docstrings explaining *data flow*, private helpers prefixed
   `_`, a small public API, type hints, NumPy-vectorised binning. Comment the *why* (format quirks,
   paper caveats), not the *what*.
-- When a new file/field is decoded, record the finding in `M150605_ICTP1_data_file_conjectures.md`
-  with a confidence level — that doc is the project's memory of what each file means.
-
-### Analysis cautions (from the paper — respect these when validating figures)
-- Extracellular detection **severely underestimates** activity in roughly the first **20 ms** after
-  strong excitatory optogenetic pulses (overlapping spikes / field fluctuations). Treat the earliest
-  trial-aligned response with suspicion.
-- Fine `chrono` Timeline↔Blackrock clock sync is **not** applied; residual drift < ~1 ms / 1000 s.
-- The E/I trough-to-peak threshold (default 0.4 ms) should be checked against the bimodal
-  waveform-width histogram per session before it's trusted.
 
 ---
 <!-- Always keep the sections below -->
