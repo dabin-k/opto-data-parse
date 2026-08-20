@@ -98,6 +98,8 @@ def smoothed_features_cg(
     seed: int = 0,
     animal_id: str | None = None,
     session: int = 1,
+    box_e: dict | None = None,
+    box_i: dict | None = None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """
     Clusterless four-feature measurement + E/I labels for one shank (wide `.dat` path).
@@ -111,7 +113,7 @@ def smoothed_features_cg(
     s = _smoothed_cg(base_dir, cg=cg, min_cluster_group=min_cluster_group,
                      sample_size=sample_size, seed=seed, animal_id=animal_id, session=session)
     feats = dl._spike_features(s["smoothed"])
-    labels = dl._classify_ei_boxes(feats)
+    labels = dl._classify_ei_boxes(feats, box_e, box_i)
     return feats, labels
 
 
@@ -158,14 +160,18 @@ def plot_s2c(
     base_dir: str | Path,
     cg: str = "0",
     sample_size: int | None = None,
+    box_e: dict | None = None,
+    box_i: dict | None = None,
     axes: np.ndarray | None = None,
     **kw,
 ):
     """
     Reproduce Fig S2.C (both panels) for one shank, with the E/I boxes drawn.
-    Returns (axes, feats, labels).  Pass `sample_size` to run on a random subset.
+    `box_e`/`box_i` default to the M150605-tuned module boxes; pass per-mouse boxes
+    for other animals.  Returns (axes, feats, labels).
     """
-    feats, labels = smoothed_features_cg(base_dir, cg=cg, sample_size=sample_size, **kw)
+    feats, labels = smoothed_features_cg(base_dir, cg=cg, sample_size=sample_size,
+                                         box_e=box_e, box_i=box_i, **kw)
     if axes is None:
         _, axes = plt.subplots(1, 2, figsize=(11, 4.6))
     colour = {0: "r", 1: "b", -1: "0.6"}
@@ -173,7 +179,7 @@ def plot_s2c(
         m = labels == L
         axes[0].scatter(feats["duration"][m], feats["fw3m"][m], s=2, c=colour[L], alpha=.2, lw=0)
         axes[1].scatter(feats["early"][m], feats["late"][m], s=2, c=colour[L], alpha=.2, lw=0)
-    for box, c in [(dl.EI_BOX_E, "r"), (dl.EI_BOX_I, "b")]:
+    for box, c in [(box_e or dl.EI_BOX_E, "r"), (box_i or dl.EI_BOX_I, "b")]:
         (d0, d1), (f0, f1) = box["duration"], box["fw3m"]
         axes[0].add_patch(plt.Rectangle((d0, f0), d1 - d0, f1 - f0, fill=False, ec=c, lw=1.5))
     axes[0].set(xlim=(0, 1.0), ylim=(0, 0.4), xlabel="spike duration (ms)",

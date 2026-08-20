@@ -14,7 +14,7 @@ Session in hand: **M150605_ICTP1**, series/session 1. One mouse exercised so far
 - Extracellular 32-ch silicon probe, 30 kHz, Blackrock amplifier. Paired LGN recording (separate pipeline, not handled here).
 - **This session: 445 nm blue → E, 561 nm green → I** (mouse-line dependent; don't assume).
 
-## Dataset layout (external — `/mnt/scratch/.../M150605_ICTP1/`, NOT in repo)
+## Dataset layout (external — `/mnt/scratch/IChunData4Dabin/.../M150605_ICTP1/`, NOT in repo)
 
 Session dir `…/1/`:
 

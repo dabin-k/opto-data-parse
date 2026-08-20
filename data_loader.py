@@ -1056,12 +1056,23 @@ def _spike_features(smoothed: np.ndarray) -> dict[str, np.ndarray]:
     )
 
 
-def _classify_ei_boxes(features: dict[str, np.ndarray]) -> np.ndarray:
+def _classify_ei_boxes(
+    features: dict[str, np.ndarray],
+    box_e: dict | None = None,
+    box_i: dict | None = None,
+) -> np.ndarray:
     """
     Two-box E/I classification (paper S1.6).  Returns labels int8:
     0 = E (in E-box on all four features), 1 = I (in I-box), -1 = discard.
     ~40% of spikes land in a box; the rest are excluded.
+
+    `box_e`/`box_i` default to the module `EI_BOX_E`/`EI_BOX_I` (tuned on M150605).
+    The paper tunes duration/FW3M boundaries per session, so pass per-mouse boxes
+    here for other animals.
     """
+    box_e = EI_BOX_E if box_e is None else box_e
+    box_i = EI_BOX_I if box_i is None else box_i
+
     def in_box(box):
         m = np.ones(len(features["duration"]), dtype=bool)
         for key, (lo, hi) in box.items():
@@ -1070,14 +1081,16 @@ def _classify_ei_boxes(features: dict[str, np.ndarray]) -> np.ndarray:
         return m
 
     labels = np.full(len(features["duration"]), -1, dtype=np.int8)
-    labels[in_box(EI_BOX_E)] = 0
-    labels[in_box(EI_BOX_I)] = 1
+    labels[in_box(box_e)] = 0
+    labels[in_box(box_i)] = 1
     return labels
 
 def _load_population_spikes(
     kwik_path: Path,
     kwx_path: Path,
     min_cluster_group: int,
+    box_e: dict | None = None,
+    box_i: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Load spikes with their E/I classification, using the paper's *clusterless*
@@ -1136,7 +1149,7 @@ def _load_population_spikes(
             # QC on the .kwx-aligned window (first 20 samples = dat[t-10:t+10]).
             qc = _waveform_qc(_baseline_subtract(filt.astype(np.float32)),
                               smoothed[:, :20], nbr_dist)
-            labels = _classify_ei_boxes(_spike_features(smoothed))   # 0=E, 1=I, -1=discard
+            labels = _classify_ei_boxes(_spike_features(smoothed), box_e, box_i)  # 0=E,1=I,-1=discard
             keep = qc & (labels != -1)
 
             all_times.append(times_m[keep].astype(np.int64))
@@ -1249,6 +1262,8 @@ def get_population_responses(
     baseline_window: tuple[float, float] = (-0.5, -0.1),
     min_cluster_group: int = 0,
     animal_id: str | None = None,
+    box_e: dict | None = None,
+    box_i: dict | None = None,
 ) -> dict[str, dict]:
     """
     Compute trial-averaged, baseline-normalised E/I population PSTHs grouped
@@ -1321,7 +1336,7 @@ def get_population_responses(
     # --- load population spike trains (E and I) -----------------------------
     print("Loading and classifying spikes …")
     pop_times, pop_labels = _load_population_spikes(
-        kwik_path, kwx_path, min_cluster_group
+        kwik_path, kwx_path, min_cluster_group, box_e, box_i
     )
     e_times = pop_times[pop_labels == 0]   # wide / excitatory
     i_times = pop_times[pop_labels == 1]   # narrow / inhibitory
