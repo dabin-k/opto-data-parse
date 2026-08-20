@@ -145,6 +145,13 @@ EI_GRAD_LATE_MS: float = 0.50
 # reaching end-of-window baseline drift (which overestimates).  Covers the E box
 # top (0.83 ms) with headroom; WIDE_POST=40 samples (~1.33 ms) bounds it.
 DURATION_PEAK_WINDOW_MS: float = 0.9
+
+# Bump whenever the E/I feature extraction or classification *logic* changes (the
+# boxes are hashed separately).  Folded into the classified-spike cache key
+# (`_ei_cache_key`) so a code change never silently reuses a stale ei_ cache.
+#   1: bounded-window duration ("following peak") on clusterless-smoothed
+#      unfiltered waveforms; two-box duration/FW3M/gradient classification.
+_EI_CLASSIFY_VERSION: int = 1
 EI_GRAD_EARLY_SPLIT: float = 270.0   # E below (slow upstroke), I above (fast)
 EI_GRAD_LATE_SPLIT: float = 0.0      # E above (still rising), I below (falling)
 # FW3M ranges: the paper lists several per-session values and picks manually per
@@ -1120,15 +1127,39 @@ def _ei_cache_key(
 ) -> str:
     """
     Cache key for the classified `(time_samples, ei_labels)` output.  Captures the
-    E/I boxes (with their module defaults resolved) as an 8-char content hash, so
-    editing a classification box invalidates the cache rather than silently
-    returning stale labels.
+    E/I boxes (with their module defaults resolved) *and* `_EI_CLASSIFY_VERSION` in
+    an 8-char content hash, so editing a classification box OR the feature/logic
+    version invalidates the cache rather than silently returning stale labels.
     """
     eff_e = EI_BOX_E if box_e is None else box_e
     eff_i = EI_BOX_I if box_i is None else box_i
-    payload = json.dumps({"e": eff_e, "i": eff_i}, sort_keys=True)
+    payload = json.dumps({"v": _EI_CLASSIFY_VERSION, "e": eff_e, "i": eff_i}, sort_keys=True)
     digest = hashlib.sha1(payload.encode()).hexdigest()[:8]
-    return f"ei_{kwx_stem}_mcg{min_cluster_group}_{digest}"
+    return f"ei_{kwx_stem}_mcg{min_cluster_group}_v{_EI_CLASSIFY_VERSION}_{digest}"
+
+
+def ei_cache_key(
+    base_dir: str | Path,
+    session: int = 1,
+    min_cluster_group: int = 0,
+    animal_id: str | None = None,
+    box_e: dict | None = None,
+    box_i: dict | None = None,
+) -> str:
+    """
+    Public: the exact classified-cache key a `get_population_responses` run would
+    use for this session — session file stem + `min_cluster_group` + effective
+    boxes + `_EI_CLASSIFY_VERSION`.  Resolves per-mouse boxes when not overridden.
+    Used to stamp provenance into saved outputs (see `regenerate_population_rates`).
+    """
+    base_dir = Path(base_dir)
+    animal_id = animal_id or base_dir.name
+    if box_e is None or box_i is None:
+        default_e, default_i = _mouse_ei_boxes(animal_id)
+        box_e = default_e if box_e is None else box_e
+        box_i = default_i if box_i is None else box_i
+    _, kwx_path, _ = _find_session_files(base_dir / str(session), animal_id, session)
+    return _ei_cache_key(kwx_path.stem, min_cluster_group, box_e, box_i)
 
 
 def _load_population_spikes(

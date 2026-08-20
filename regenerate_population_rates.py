@@ -27,6 +27,9 @@ def regenerate(animal_id: str) -> None:
         flat[f"{exp_type}__responses"] = res["responses"]
         flat[f"{exp_type}__time_axis"] = res["time_axis"]
         flat[f"{exp_type}__conditions"] = np.array(json.dumps(res["conditions"]))
+    # Provenance: the exact classified-cache key this run used (session + boxes +
+    # classification version), so the file records how its E/I labels were produced.
+    flat["ei_cache_key"] = np.array(data_loader.ei_cache_key(base_dir, animal_id=animal_id))
     out_path = OUT_DIR / f"population_rates_{animal_id}_s1.npz"
     np.savez(out_path, **flat)
     n_bins = next(iter(out.values()))["time_axis"].shape[0]
