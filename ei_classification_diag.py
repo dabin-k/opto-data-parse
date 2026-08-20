@@ -38,9 +38,9 @@ def _uv(dw):
 
 # The four classification features: (feature key, axis label, plot x-range).
 METRICS = [("duration", "spike duration (ms)", (0.0, 1.2)),
-           ("fw3m",     "FW3M (ms)",            (0.0, 0.40)),
-           ("early",    "trough grad (uV/ms)",  (0.0, 700.0)),
-           ("late",     "peak grad (uV/ms)",    (-150.0, 150.0))]
+           ("fw3m",     "FW3M (ms)",            (0.0, 0.80)),
+           ("early",    "trough grad (uV/ms)",  (0.0, 900.0)),
+           ("late",     "peak grad (uV/ms)",    (-150.0, 250.0))]
 
 
 def classify_sample(s, animal_id):
@@ -99,14 +99,15 @@ def _plot_waveform(ax, w_uv):
     ax.set(xlabel="ms from trough", ylabel="amplitude (uV)")
 
 
-def plot_metric_distributions(name, base, sample_size=8000, seed=0):
+def plot_metric_distributions(name, base, min_cluster_group=2, sample_size=8000, seed=0):
     """One figure per mouse: histograms of the four classification metrics
     (duration, FW3M, trough grad, peak grad) over a sample of this mouse's spikes,
     with the E box range shaded red and the I box range shaded blue for each — so
     you can see the distributions against the cuts (e.g. where E candidates pile up
     just outside the E box)."""
     animal_id = Path(base).name
-    s = figures._smoothed_cg(base, cg="0", sample_size=sample_size, seed=seed)
+    s = figures._smoothed_cg(base, cg="0", min_cluster_group=min_cluster_group,
+                             sample_size=sample_size, seed=seed)
     feats = dl._spike_features(s["smoothed"])
     box_e, box_i = dl._mouse_ei_boxes(animal_id)
 
@@ -124,12 +125,12 @@ def plot_metric_distributions(name, base, sample_size=8000, seed=0):
     fig.suptitle(f"{name}: classification metric distributions (E box = red, I box = blue)",
                  fontsize=12)
     fig.tight_layout()
-    out = f"results/metric_distributions_{name}.png"
+    out = f"results/metric_distributions_mcg_{min_cluster_group}_{name}.png"
     fig.savefig(out, dpi=120)
     print("saved", out)
 
 
-def plot_spikes_by_class(name, base, counts=None, ncol=4, seed=1, sample_size=3000):
+def plot_spikes_by_class(name, base, min_cluster_group=2    , counts=None, ncol=4, seed=1, sample_size=3000):
     """Grid of example spikes grouped by class (to see *why* E-like spikes are or
     aren't kept): `counts[class]` random members of each class, each with its
     smoothed waveform and colour-coded feature legend.  Extra neither spikes help
@@ -137,7 +138,8 @@ def plot_spikes_by_class(name, base, counts=None, ncol=4, seed=1, sample_size=30
     neither, laid out at `ncol` columns."""
     counts = counts or {"putative E": 4, "putative I": 4, "neither": 8}
     animal_id = Path(base).name
-    s = figures._smoothed_cg(base, cg="0", sample_size=sample_size, seed=seed)
+    s = figures._smoothed_cg(base, cg="0", min_cluster_group=min_cluster_group,
+                             sample_size=sample_size, seed=seed)
     labels = classify_sample(s, animal_id)
     dw_uv = _uv(dl._dominant_trace(s["smoothed"]))   # smoothed waveform = what's classified
     feats = dl._spike_features(s["smoothed"])        # per-spike classification features
@@ -165,7 +167,7 @@ def plot_spikes_by_class(name, base, counts=None, ncol=4, seed=1, sample_size=30
         r0 += rows_per[cls]
     fig.suptitle(f"{name}: example spikes by class (per-mouse box + QC)", fontsize=12)
     fig.tight_layout()
-    out = f"results/random_spikes_{name}.png"
+    out = f"results/random_spikes_mcg_{min_cluster_group}_{name}.png"
     fig.savefig(out, dpi=120)
     print("saved", out)
 

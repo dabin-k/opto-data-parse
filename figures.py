@@ -38,7 +38,7 @@ import h5py
 def _smoothed_cg(
     base_dir: str | Path,
     cg: str = "0",
-    min_cluster_group: int = 0,
+    min_cluster_group: int = 2,
     sample_size: int | None = None,
     seed: int = 0,
     animal_id: str | None = None,
@@ -94,7 +94,7 @@ def _smoothed_cg(
 def smoothed_features_cg(
     base_dir: str | Path,
     cg: str = "0",
-    min_cluster_group: int = 0,
+    min_cluster_group: int = 2,
     sample_size: int | None = None,
     seed: int = 0,
     animal_id: str | None = None,
@@ -110,7 +110,7 @@ def smoothed_features_cg(
     random subset of queries (full pool still searched); None = all spikes.
 
     `box_e`/`box_i` default (None) to the per-mouse boxes for `animal_id`
-    (bespoke FW3M ranges, `data_loader._mouse_ei_boxes`); pass a dict to override.
+    (full four-metric spec via `data_loader._mouse_ei_boxes`); pass a dict to override.
 
     Returns (features, labels).  labels: 0=E, 1=I, -1=discard.
     """
@@ -177,8 +177,8 @@ def plot_s2c(
     """
     Reproduce Fig S2.C (both panels) for one shank as a log-scaled 2D density
     map (matching the paper), with the E/I boxes drawn.  `box_e`/`box_i` default
-    to the per-mouse boxes for the animal (bespoke FW3M ranges, `fw3m.py`); pass a
-    dict to override.  Returns (axes, feats, labels).
+    to the per-mouse boxes for the animal (`ei_classification_specification.py`);
+    pass a dict to override.  Returns (axes, feats, labels).
     """
     animal_id = kw.pop("animal_id", None) or Path(base_dir).name
     if box_e is None or box_i is None:

@@ -75,7 +75,7 @@ import numpy as np
 import scipy.io
 from scipy.signal import windows as signal_windows
 
-import fw3m
+import ei_classification_specification as ei_spec
 import laser_timing
 import mouse_lines
 
@@ -168,18 +168,15 @@ EI_BOX_I = dict(duration=(0.13, 0.33), fw3m=(0.10, 0.18),
 
 def _mouse_ei_boxes(animal_id: str) -> tuple[dict, dict]:
     """
-    (box_e, box_i) for an animal: the module-default boxes with only their FW3M
-    range replaced by the mouse's hand-picked range (`fw3m.mouse_fw3m_ranges`).
-    Falls back to the default FW3M for a mouse without a bespoke entry, so unknown
-    animals keep the previous behaviour.  The duration / gradient cuts are unchanged.
+    (box_e, box_i) for an animal: the full four-metric per-mouse E/I spec from
+    `ei_classification_specification.mouse_ei_boxes` (each metric tuned per mouse).
+    Falls back to the module-default boxes (`EI_BOX_E`/`EI_BOX_I`) for a mouse
+    without a bespoke spec, so unknown animals keep the previous behaviour.
     """
-    box_e, box_i = dict(EI_BOX_E), dict(EI_BOX_I)
     try:
-        wide_fw3m, narrow_fw3m = fw3m.mouse_fw3m_ranges(animal_id)
-        box_e["fw3m"], box_i["fw3m"] = wide_fw3m, narrow_fw3m
+        return ei_spec.mouse_ei_boxes(animal_id)
     except KeyError:
-        pass  # no bespoke ranges for this mouse -> keep module-default FW3M
-    return box_e, box_i
+        return dict(EI_BOX_E), dict(EI_BOX_I)  # no per-mouse spec -> module defaults
 
 
 def _find_session_files(
@@ -788,13 +785,13 @@ def prebuild_knn_caches(
     base_dir: str | Path,
     animal_id: str | None = None,
     session: int = 1,
-    min_cluster_group: int = 0,
+    min_cluster_group: int = 2,
 ) -> None:
     """
     Build the k-NN cache for every channel group (shank) of a session, skipping any
     already cached.  Safe to re-run and to interrupt — each shank is written
     atomically by `_load_or_build_knn`, so an overnight "build everything" run is
-    restartable.  `min_cluster_group=0` matches the clusterless default.
+    restartable.  `min_cluster_group=0` matches the paper's clusterless pool.
     """
     base_dir = Path(base_dir)
     animal_id = animal_id or base_dir.name
@@ -1141,7 +1138,7 @@ def _ei_cache_key(
 def ei_cache_key(
     base_dir: str | Path,
     session: int = 1,
-    min_cluster_group: int = 0,
+    min_cluster_group: int = 2,
     animal_id: str | None = None,
     box_e: dict | None = None,
     box_i: dict | None = None,
@@ -1176,8 +1173,8 @@ def _load_population_spikes(
     of the I population).  Every spike is smoothed and kept unless it fails the
     waveform quality-control checks (`_waveform_qc`).
 
-    `min_cluster_group` still selects the neighbour pool (default 0 = all spikes =
-    clusterless); pass >0 only to fall back to a cluster-filtered pool.
+    `min_cluster_group` selects the neighbour pool (2 = good clusters only, our
+    standing default; 0 = all spikes = the paper's clusterless pool).
 
     Returns
     -------
@@ -1346,7 +1343,7 @@ def get_population_responses(
     bin_s: float = 0.001,
     hamming_ms: float = 40.0,
     baseline_window: tuple[float, float] = (-0.5, -0.1),
-    min_cluster_group: int = 0,
+    min_cluster_group: int = 2,
     animal_id: str | None = None,
     box_e: dict | None = None,
     box_i: dict | None = None,
@@ -1383,15 +1380,13 @@ def get_population_responses(
         Time interval (relative to onset) used for normalisation.
         Paper uses (–0.5, –0.1) s.
     min_cluster_group : int
-        Neighbour-pool selection for the *clusterless* E/I split.  Default 0 keeps
-        all spikes (the paper's method — noise is rejected by `_waveform_qc`, not by
-        cluster label).  Pass >0 only to fall back to a cluster-filtered pool
-        (1 = MUA+unsorted, 2 = good only).
+        Neighbour-pool selection for the *clusterless* E/I split.  Default 2 keeps
+        only good clusters.  0 keeps all spikes (the paper's clusterless method —
+        noise rejected by `_waveform_qc`, not by cluster label); 1 = MUA+unsorted.
     box_e, box_i : dict, optional
         E/I classification boxes.  Default (None) resolves per-mouse boxes via
-        `_mouse_ei_boxes(animal_id)` — the module-default duration/gradient cuts
-        with the mouse's hand-picked FW3M range (`fw3m.py`).  Pass a dict to
-        override that box explicitly.
+        `_mouse_ei_boxes(animal_id)` — the full four-metric per-mouse spec in
+        `ei_classification_specification.py`.  Pass a dict to override explicitly.
 
     Returns
     -------
@@ -1416,7 +1411,7 @@ def get_population_responses(
         animal_id = base_dir.name
     session_dir = base_dir / str(session)
 
-    # Per-mouse E/I boxes (bespoke FW3M ranges) unless the caller overrode a box.
+    # Per-mouse E/I boxes (full four-metric spec) unless the caller overrode a box.
     if box_e is None or box_i is None:
         default_e, default_i = _mouse_ei_boxes(animal_id)
         box_e = default_e if box_e is None else box_e
