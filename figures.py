@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import numpy as np
 
 import data_loader as dl
@@ -108,8 +109,16 @@ def smoothed_features_cg(
     `data_loader._spike_features` and `_classify_ei_boxes`.  `sample_size` runs a
     random subset of queries (full pool still searched); None = all spikes.
 
+    `box_e`/`box_i` default (None) to the per-mouse boxes for `animal_id`
+    (bespoke FW3M ranges, `data_loader._mouse_ei_boxes`); pass a dict to override.
+
     Returns (features, labels).  labels: 0=E, 1=I, -1=discard.
     """
+    animal_id = animal_id or Path(base_dir).name
+    if box_e is None or box_i is None:
+        default_e, default_i = dl._mouse_ei_boxes(animal_id)
+        box_e = default_e if box_e is None else box_e
+        box_i = default_i if box_i is None else box_i
     s = _smoothed_cg(base_dir, cg=cg, min_cluster_group=min_cluster_group,
                      sample_size=sample_size, seed=seed, animal_id=animal_id, session=session)
     feats = dl._spike_features(s["smoothed"])
@@ -166,20 +175,36 @@ def plot_s2c(
     **kw,
 ):
     """
-    Reproduce Fig S2.C (both panels) for one shank, with the E/I boxes drawn.
-    `box_e`/`box_i` default to the M150605-tuned module boxes; pass per-mouse boxes
-    for other animals.  Returns (axes, feats, labels).
+    Reproduce Fig S2.C (both panels) for one shank as a log-scaled 2D density
+    map (matching the paper), with the E/I boxes drawn.  `box_e`/`box_i` default
+    to the per-mouse boxes for the animal (bespoke FW3M ranges, `fw3m.py`); pass a
+    dict to override.  Returns (axes, feats, labels).
     """
+    animal_id = kw.pop("animal_id", None) or Path(base_dir).name
+    if box_e is None or box_i is None:
+        default_e, default_i = dl._mouse_ei_boxes(animal_id)
+        box_e = default_e if box_e is None else box_e
+        box_i = default_i if box_i is None else box_i
     feats, labels = smoothed_features_cg(base_dir, cg=cg, sample_size=sample_size,
-                                         box_e=box_e, box_i=box_i, **kw)
+                                         box_e=box_e, box_i=box_i, animal_id=animal_id, **kw)
     if axes is None:
         _, axes = plt.subplots(1, 2, figsize=(11, 4.6))
-    colour = {0: "r", 1: "b", -1: "0.6"}
-    for L in (-1, 0, 1):
-        m = labels == L
-        axes[0].scatter(feats["duration"][m], feats["fw3m"][m], s=2, c=colour[L], alpha=.2, lw=0)
-        axes[1].scatter(feats["early"][m], feats["late"][m], s=2, c=colour[L], alpha=.2, lw=0)
-    for box, c in [(box_e or dl.EI_BOX_E, "r"), (box_i or dl.EI_BOX_I, "b")]:
+
+    # Paper S2.C is a density map, not a scatter.  With ~10^5 spikes an alpha
+    # scatter overplots and hides the sparse valley *between* the E and I clusters
+    # — the "gap" that justifies the two-box cut.  hist2d on a log colour scale
+    # shows the dense clusters and that low-density gap on the same axis.  Density
+    # is over all QC-passing spikes (E, I and discarded alike) so the full
+    # feature-space structure is visible; the boxes then show where we cut.
+    def _density(ax, x, y, xrange, yrange, bins=140):
+        m = np.isfinite(x) & np.isfinite(y)
+        h = ax.hist2d(x[m], y[m], bins=bins, range=[xrange, yrange],
+                      norm=LogNorm(), cmap="Greys")
+        ax.figure.colorbar(h[3], ax=ax, label="spike count", pad=0.01)
+
+    _density(axes[0], feats["duration"], feats["fw3m"], (0, 1.0), (0, 0.4))
+    _density(axes[1], feats["early"], feats["late"], (0, 600), (-150, 150))
+    for box, c in [(box_e, "r"), (box_i, "b")]:
         (d0, d1), (f0, f1) = box["duration"], box["fw3m"]
         axes[0].add_patch(plt.Rectangle((d0, f0), d1 - d0, f1 - f0, fill=False, ec=c, lw=1.5))
     axes[0].set(xlim=(0, 1.0), ylim=(0, 0.4), xlabel="spike duration (ms)",

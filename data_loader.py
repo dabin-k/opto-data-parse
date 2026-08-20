@@ -65,6 +65,8 @@ Caveats
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -73,6 +75,7 @@ import numpy as np
 import scipy.io
 from scipy.signal import windows as signal_windows
 
+import fw3m
 import laser_timing
 import mouse_lines
 
@@ -136,6 +139,12 @@ QC_XCH_VAR_AMP_RATIO_UV: float = 0.05
 # `_spike_features` returns).  Session-tunable, like the paper's per-session boxes.
 EI_GRAD_EARLY_MS: float = 0.07
 EI_GRAD_LATE_MS: float = 0.50
+# Duration = trough -> "following peak" (paper S1.6).  We take the max of the
+# smoothed waveform within this post-trough window rather than the first local
+# max: it skips small early shoulders (which underestimate the E cells) without
+# reaching end-of-window baseline drift (which overestimates).  Covers the E box
+# top (0.83 ms) with headroom; WIDE_POST=40 samples (~1.33 ms) bounds it.
+DURATION_PEAK_WINDOW_MS: float = 0.9
 EI_GRAD_EARLY_SPLIT: float = 270.0   # E below (slow upstroke), I above (fast)
 EI_GRAD_LATE_SPLIT: float = 0.0      # E above (still rising), I below (falling)
 # FW3M ranges: the paper lists several per-session values and picks manually per
@@ -148,6 +157,22 @@ EI_BOX_E = dict(duration=(0.47, 0.83), fw3m=(0.18, 0.30),
                 early=(-np.inf, EI_GRAD_EARLY_SPLIT), late=(EI_GRAD_LATE_SPLIT, np.inf))
 EI_BOX_I = dict(duration=(0.13, 0.33), fw3m=(0.10, 0.18),
                 early=(EI_GRAD_EARLY_SPLIT, np.inf), late=(-np.inf, EI_GRAD_LATE_SPLIT))
+
+
+def _mouse_ei_boxes(animal_id: str) -> tuple[dict, dict]:
+    """
+    (box_e, box_i) for an animal: the module-default boxes with only their FW3M
+    range replaced by the mouse's hand-picked range (`fw3m.mouse_fw3m_ranges`).
+    Falls back to the default FW3M for a mouse without a bespoke entry, so unknown
+    animals keep the previous behaviour.  The duration / gradient cuts are unchanged.
+    """
+    box_e, box_i = dict(EI_BOX_E), dict(EI_BOX_I)
+    try:
+        wide_fw3m, narrow_fw3m = fw3m.mouse_fw3m_ranges(animal_id)
+        box_e["fw3m"], box_i["fw3m"] = wide_fw3m, narrow_fw3m
+    except KeyError:
+        pass  # no bespoke ranges for this mouse -> keep module-default FW3M
+    return box_e, box_i
 
 
 def _find_session_files(
@@ -870,11 +895,13 @@ def _clusterless_smooth_waveforms(
     max_neighbours: int = KNN_K,
 ) -> np.ndarray:
     """
-    Denoise each spike by averaging the filtered waveforms of its nearest
-    neighbours in feature space (paper S1.6).
+    Denoise each spike by averaging the waveforms of its nearest neighbours in
+    feature space (paper S1.6).  In the E/I path `waveforms` are the *unfiltered*
+    wide snippets re-extracted from the `.dat`, matching the paper's "smoothed
+    unfiltered waveform".
 
     Distance is measured on the PCA features (already computed into `nbr_dist`);
-    averaging is over the raw filtered `waveforms`.  Neighbours are pre-sorted
+    averaging is over the passed-in `waveforms`.  Neighbours are pre-sorted
     near -> far, so capping at `max_neighbours` keeps the *nearest* ones; the
     radius then drops any beyond `distance_threshold` (self is always kept).
 
@@ -1020,8 +1047,9 @@ def _spike_features(smoothed: np.ndarray) -> dict[str, np.ndarray]:
       early    : gradient at 0.07 ms after trough (uV/ms)
       late     : gradient at 0.50 ms after trough (uV/ms)
 
-    Duration uses the first local maximum (repolarization peak), not the global
-    argmax, so tail noise/drift in the unfiltered wide waveform cannot inflate it.
+    Duration is trough -> the max within DURATION_PEAK_WINDOW_MS after it (the
+    paper's "following peak"), so an early shoulder can't collapse it short and
+    end-of-window drift can't inflate it.
     """
     dw = _dominant_trace(smoothed)
     n, ns = dw.shape
@@ -1029,12 +1057,14 @@ def _spike_features(smoothed: np.ndarray) -> dict[str, np.ndarray]:
     fs_khz = SAMPLE_RATE_HZ / 1000.0
     trough = dw.argmin(1)
 
-    # first local max after the trough: first descending step at index >= trough
-    desc = np.diff(dw, axis=1) < 0                          # (n, ns-1)
-    step = np.arange(ns - 1)[np.newaxis, :]
-    after = desc & (step >= trough[:, np.newaxis])
-    has_peak = after.any(1)
-    peak = np.where(has_peak, after.argmax(1), ns - 1)      # local-max sample
+    # "following peak" = max of the smoothed waveform within a physiological window
+    # after the trough (paper S1.6).  A bounded-window max avoids two failure modes
+    # of a bare first-local-max: an early shoulder just past the trough (which
+    # collapses duration short and drops E cells) and end-of-window drift.
+    win = int(round(DURATION_PEAK_WINDOW_MS * fs_khz))
+    grid = np.arange(ns)[np.newaxis, :]
+    in_win = (grid >= trough[:, np.newaxis]) & (grid <= (trough + win)[:, np.newaxis])
+    peak = np.where(in_win, dw, -np.inf).argmax(1)          # following-peak sample
     # parabolic sub-sample refinement around the peak
     pj = np.clip(peak, 1, ns - 2)
     y0, y1, y2 = dw[idx, pj - 1], dw[idx, pj], dw[idx, pj + 1]
@@ -1085,6 +1115,22 @@ def _classify_ei_boxes(
     labels[in_box(box_i)] = 1
     return labels
 
+def _ei_cache_key(
+    kwx_stem: str, min_cluster_group: int, box_e: dict | None, box_i: dict | None
+) -> str:
+    """
+    Cache key for the classified `(time_samples, ei_labels)` output.  Captures the
+    E/I boxes (with their module defaults resolved) as an 8-char content hash, so
+    editing a classification box invalidates the cache rather than silently
+    returning stale labels.
+    """
+    eff_e = EI_BOX_E if box_e is None else box_e
+    eff_i = EI_BOX_I if box_i is None else box_i
+    payload = json.dumps({"e": eff_e, "i": eff_i}, sort_keys=True)
+    digest = hashlib.sha1(payload.encode()).hexdigest()[:8]
+    return f"ei_{kwx_stem}_mcg{min_cluster_group}_{digest}"
+
+
 def _load_population_spikes(
     kwik_path: Path,
     kwx_path: Path,
@@ -1108,6 +1154,13 @@ def _load_population_spikes(
                    outside both classification boxes are discarded — the paper keeps ~40%)
     ei_labels    : (n_spikes,) int8   — 0 = E (wide), 1 = I (narrow)
     """
+    CACHE_DIR.mkdir(exist_ok=True)
+    ei_path = CACHE_DIR / f"{_ei_cache_key(kwx_path.stem, min_cluster_group, box_e, box_i)}.npz"
+    if ei_path.exists():
+        print(f"ei: using cached {ei_path.name}", flush=True)
+        d = np.load(ei_path)
+        return d["time_samples"], d["ei_labels"]
+
     all_times: list[np.ndarray] = []
     all_labels: list[np.ndarray] = []
 
@@ -1158,7 +1211,9 @@ def _load_population_spikes(
     time_samples = np.concatenate(all_times)
     ei_labels = np.concatenate(all_labels)
     order = np.argsort(time_samples, kind="stable")
-    return time_samples[order], ei_labels[order]
+    time_samples, ei_labels = time_samples[order], ei_labels[order]
+    np.savez(ei_path, time_samples=time_samples, ei_labels=ei_labels)
+    return time_samples, ei_labels
 
 
 def _load_protocol_conditions(
@@ -1257,7 +1312,7 @@ def get_population_responses(
     selected_exps: list[int] | None = None,
     pre_s: float = 0.5,
     post_s: float = 1.5,
-    bin_s: float = 0.005,
+    bin_s: float = 0.001,
     hamming_ms: float = 40.0,
     baseline_window: tuple[float, float] = (-0.5, -0.1),
     min_cluster_group: int = 0,
@@ -1286,7 +1341,11 @@ def get_population_responses(
     pre_s, post_s : float
         Trial window around stimulus onset (seconds).
     bin_s : float
-        Spike-count bin width (seconds).
+        Spike-count bin width (seconds).  Default 1 ms.  The paper bins at the
+        1/30 ms sample period before smoothing; at the 40 ms Hamming window used
+        here, 1 ms is empirically indistinguishable from 0.2 ms and finer, while
+        5 ms visibly clips/mis-times the fast onset transient in short-IPI
+        conditions.  The output keeps only 2 populations, so fine bins are cheap.
     hamming_ms : float
         Hamming smoothing window width (milliseconds).  Paper uses 40 ms.
     baseline_window : (float, float)
@@ -1297,6 +1356,11 @@ def get_population_responses(
         all spikes (the paper's method — noise is rejected by `_waveform_qc`, not by
         cluster label).  Pass >0 only to fall back to a cluster-filtered pool
         (1 = MUA+unsorted, 2 = good only).
+    box_e, box_i : dict, optional
+        E/I classification boxes.  Default (None) resolves per-mouse boxes via
+        `_mouse_ei_boxes(animal_id)` — the module-default duration/gradient cuts
+        with the mouse's hand-picked FW3M range (`fw3m.py`).  Pass a dict to
+        override that box explicitly.
 
     Returns
     -------
@@ -1306,8 +1370,10 @@ def get_population_responses(
             Trial-averaged, Hamming-smoothed, baseline-normalised population
             activity.  Axis 1: 0 = E (wide), 1 = I (narrow).
         'conditions' : list of dicts, length n_conditions
-            Per-condition stimulus parameters:
-              pulse_type, ipi_ms, dur_ms  (plus ipi2_ms for paired types)
+            Per-condition stimulus parameters plus provenance:
+              pulse_type, ipi_ms, dur_ms, first_pop, second_pop, n_trials
+            n_trials is how many trials were averaged into that row of
+            'responses'.
         'time_axis'  : ndarray (n_bins,)
             Bin centres in seconds relative to stimulus onset.
 
@@ -1318,6 +1384,12 @@ def get_population_responses(
     if animal_id is None:
         animal_id = base_dir.name
     session_dir = base_dir / str(session)
+
+    # Per-mouse E/I boxes (bespoke FW3M ranges) unless the caller overrode a box.
+    if box_e is None or box_i is None:
+        default_e, default_i = _mouse_ei_boxes(animal_id)
+        box_e = default_e if box_e is None else box_e
+        box_i = default_i if box_i is None else box_i
 
     kwik_path, kwx_path, manifest_path = _find_session_files(
         session_dir, animal_id, session
@@ -1410,6 +1482,7 @@ def get_population_responses(
 
         for ckey in sorted_keys:
             trial_counts = np.stack(cond_dict[ckey])   # (n_trials, 2, n_bins)
+            n_trials = trial_counts.shape[0]
             mean_counts = trial_counts.mean(axis=0)     # (2, n_bins)
             rate = mean_counts / bin_s                  # spikes / s
 
@@ -1428,7 +1501,8 @@ def get_population_responses(
             pt, ipi, dur = ckey
             first, second = _pulse_populations(pt, wl_to_pop)
             cond_meta = dict(pulse_type=pt, ipi_ms=ipi, dur_ms=dur,
-                             first_pop=first, second_pop=second)
+                             first_pop=first, second_pop=second,
+                             n_trials=n_trials)  # trials averaged into this row
             conditions_list.append(cond_meta)
 
         output[exp_type] = dict(
