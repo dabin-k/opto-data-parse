@@ -1347,10 +1347,19 @@ def get_population_responses(
     animal_id: str | None = None,
     box_e: dict | None = None,
     box_i: dict | None = None,
+    n_folds: int = 3,
+    fold_seed: int = 0,
 ) -> dict[str, dict]:
     """
     Compute trial-averaged, baseline-normalised E/I population PSTHs grouped
     by experiment type and stimulus condition.
+
+    Each condition's trials are randomly split into `n_folds` folds and averaged
+    *within* each fold, so the output holds one PSTH per fold rather than a single
+    all-trials mean.  This mirrors the paper's k-fold cross-validation (S1.10):
+    downstream, train/test PSTHs are built by averaging held-in folds and holding
+    out the remaining one.  Averaging the fold means (weighted by
+    `n_trials_per_fold`) recovers the all-trials mean when needed.
 
     Population activity follows the paper's definition (Lin & Harris 2020,
     Supplemental Fig. S2): the total firing rate of all wide-spike (E) or
@@ -1387,18 +1396,28 @@ def get_population_responses(
         E/I classification boxes.  Default (None) resolves per-mouse boxes via
         `_mouse_ei_boxes(animal_id)` — the full four-metric per-mouse spec in
         `ei_classification_specification.py`.  Pass a dict to override explicitly.
+    n_folds : int
+        Number of cross-validation folds to split each condition's trials into.
+        Default 3 (the paper's k for the mice we parse).  Folds are as even as
+        possible; the seeded permutation makes the split deterministic.
+    fold_seed : int
+        Seed for the RNG that permutes trials before folding.  Fixed so the split
+        is reproducible; stamped into saved outputs for provenance.
 
     Returns
     -------
     dict mapping experiment-type string → result dict, where result dict has:
 
-        'responses' : ndarray (n_conditions, 2, n_bins), float64
-            Trial-averaged, Hamming-smoothed, baseline-normalised population
-            activity.  Axis 1: 0 = E (wide), 1 = I (narrow).
+        'responses' : ndarray (n_conditions, n_folds, 2, n_bins), float64
+            Per-fold trial-averaged, Hamming-smoothed, baseline-normalised
+            population activity.  Axis 2: 0 = E (wide), 1 = I (narrow).  A fold
+            with no trials (condition with fewer trials than `n_folds`) is NaN.
         'conditions' : list of dicts, length n_conditions
             Per-condition stimulus parameters plus provenance:
-              pulse_type, ipi_ms, dur_ms, first_pop, second_pop, n_trials
-            n_trials is how many trials were averaged into that row of
+              pulse_type, ipi_ms, dur_ms, first_pop, second_pop,
+              n_trials, n_trials_per_fold
+            n_trials is the total across folds; n_trials_per_fold is the list of
+            per-fold trial counts (length n_folds), aligned to axis 1 of
             'responses'.
         'time_axis'  : ndarray (n_bins,)
             Bin centres in seconds relative to stimulus onset.
@@ -1492,7 +1511,22 @@ def get_population_responses(
             ckey = (trial["pulse_type"], trial["ipi_ms"], trial["dur_ms"])
             accum.setdefault(exp_type, {}).setdefault(ckey, []).append(counts)
 
-    # --- average, smooth, normalise -----------------------------------------
+    # --- fold, average, smooth, normalise -----------------------------------
+    # One seeded RNG stream, consumed in a deterministic condition order, makes
+    # the fold split reproducible from `fold_seed` alone.
+    rng = np.random.default_rng(fold_seed)
+
+    def _psth(counts_2xn: np.ndarray) -> np.ndarray:
+        """Fold-mean spike counts (2, n_bins) -> smoothed, baseline-normalised."""
+        rate = counts_2xn / bin_s                       # spikes / s
+        smoothed = np.stack([
+            np.convolve(rate[pop], kernel, mode="same")
+            for pop in range(2)
+        ])                                              # (2, n_bins)
+        baseline_rate = smoothed[:, baseline_mask].mean(axis=1, keepdims=True)
+        baseline_rate = np.maximum(baseline_rate, 1e-6)  # avoid /0
+        return smoothed / baseline_rate
+
     output: dict[str, dict] = {}
 
     for exp_type in ALL_EXP_TYPES:
@@ -1509,30 +1543,32 @@ def get_population_responses(
         for ckey in sorted_keys:
             trial_counts = np.stack(cond_dict[ckey])   # (n_trials, 2, n_bins)
             n_trials = trial_counts.shape[0]
-            mean_counts = trial_counts.mean(axis=0)     # (2, n_bins)
-            rate = mean_counts / bin_s                  # spikes / s
 
-            # Hamming smoothing per population
-            smoothed = np.stack([
-                np.convolve(rate[pop], kernel, mode="same")
-                for pop in range(2)
-            ])  # (2, n_bins)
+            # As-even-as-possible random split into n_folds (earlier folds absorb
+            # the remainder).  Empty folds (n_trials < n_folds) -> NaN PSTH, count 0.
+            perm = rng.permutation(n_trials)
+            fold_idx = np.array_split(perm, n_folds)
 
-            # Baseline normalisation
-            baseline_rate = smoothed[:, baseline_mask].mean(axis=1, keepdims=True)
-            baseline_rate = np.maximum(baseline_rate, 1e-6)  # avoid /0
-            normalised = smoothed / baseline_rate
+            fold_psths = []
+            n_per_fold = []
+            for idx in fold_idx:
+                n_per_fold.append(int(idx.size))
+                if idx.size == 0:
+                    fold_psths.append(np.full((2, n_bins), np.nan))
+                    continue
+                fold_psths.append(_psth(trial_counts[idx].mean(axis=0)))
 
-            responses_list.append(normalised)
+            responses_list.append(np.stack(fold_psths))   # (n_folds, 2, n_bins)
             pt, ipi, dur = ckey
             first, second = _pulse_populations(pt, wl_to_pop)
             cond_meta = dict(pulse_type=pt, ipi_ms=ipi, dur_ms=dur,
                              first_pop=first, second_pop=second,
-                             n_trials=n_trials)  # trials averaged into this row
+                             n_trials=n_trials,            # total across folds
+                             n_trials_per_fold=n_per_fold)  # aligned to axis 1
             conditions_list.append(cond_meta)
 
         output[exp_type] = dict(
-            responses=np.stack(responses_list),   # (n_cond, 2, n_bins)
+            responses=np.stack(responses_list),   # (n_cond, n_folds, 2, n_bins)
             conditions=conditions_list,
             time_axis=time_axis,
         )

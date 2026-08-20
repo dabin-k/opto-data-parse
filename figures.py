@@ -222,6 +222,7 @@ def plot_s2c(
 def plot_population_rates(
     npz_path: str | Path,
     condition: int = 0,
+    fold: int | None = None,
     types: list[str] | None = None,
     axes: np.ndarray | None = None,
 ):
@@ -229,7 +230,7 @@ def plot_population_rates(
     Plot E (wide) and I (narrow) population PSTHs for one stimulus condition of each
     experiment type, from a `population_rates_*.npz` saved by
     `data_loader.get_population_responses` (keys `{type}__responses` of shape
-    (n_conditions, 2, n_bins), `{type}__time_axis`).
+    (n_conditions, n_folds, 2, n_bins), `{type}__time_axis`).
 
     Rates are trial-averaged, Hamming-smoothed and baseline-normalised (~1 at rest).
 
@@ -237,6 +238,9 @@ def plot_population_rates(
     ----------
     condition : int
         Which stimulus condition (row of `responses`) to draw for each type.
+    fold : int, optional
+        Which cross-validation fold to draw.  Default (None) averages across
+        folds (NaN-aware).  Legacy 3-D npz files (no fold axis) ignore this.
 
     Returns
     -------
@@ -244,7 +248,8 @@ def plot_population_rates(
     """
     d = np.load(str(npz_path), allow_pickle=True)
     if types is None:
-        types = sorted({k.split("__")[0] for k in d.files})
+        types = sorted({k.split("__")[0] for k in d.files
+                        if k.endswith("__responses")})
     if axes is None:
         ncol = 3
         nrow = int(np.ceil(len(types) / ncol))
@@ -252,13 +257,20 @@ def plot_population_rates(
                                squeeze=False)
     flat = np.ravel(axes)
     for ax, t in zip(flat, types):
-        resp = d[f"{t}__responses"]                 # (n_cond, 2, n_bins)
+        resp = d[f"{t}__responses"]                 # (n_cond, n_folds, 2, n_bins)
         tax = d[f"{t}__time_axis"]
         c = min(condition, resp.shape[0] - 1)
-        ax.plot(tax, resp[c, 0], "r", label="E (wide)")
-        ax.plot(tax, resp[c, 1], "b", label="I (narrow)")
+        if resp.ndim == 4:                          # collapse the fold axis
+            row = (np.nanmean(resp[c], axis=0) if fold is None
+                   else resp[c, min(fold, resp.shape[1] - 1)])
+            fold_lbl = "fold-mean" if fold is None else f"fold {fold}"
+        else:                                       # legacy 3-D file
+            row = resp[c]
+            fold_lbl = "all trials"
+        ax.plot(tax, row[0], "r", label="E (wide)")
+        ax.plot(tax, row[1], "b", label="I (narrow)")
         ax.axvline(0, color="k", lw=0.5)
-        ax.set(title=f"{t} (cond {c} of {resp.shape[0]})",
+        ax.set(title=f"{t} (cond {c} of {resp.shape[0]}, {fold_lbl})",
                xlabel="time from onset (s)", ylabel="norm. rate")
         ax.legend(fontsize=7)
     for ax in flat[len(types):]:
