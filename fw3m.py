@@ -27,8 +27,8 @@ _NARROW = {
 
 # Filesystem mouse prefix -> (wide/E FW3M range, narrow/I FW3M range).
 _MOUSE_FW3M: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {
-    "M150605": (_WIDE["18_30"], _NARROW["07_20"]),
-    "M150609": (_WIDE["15_30"], _NARROW["07_20"]),  # wide fit poor here; widened low end
+    "M150605": (_WIDE["18_30"], _NARROW["08_18"]),
+    "M150609": (_WIDE["18_30"], _NARROW["08_18"]),  # wide fit poor here; widened low end
 }
 
 

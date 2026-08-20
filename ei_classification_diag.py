@@ -83,7 +83,7 @@ def _feature_legend(ax, feats, ei, box_e, box_i):
         labels.append(f"{name}: {fmt.format(v)}")
         colors.append(_feat_color(v, box_e, box_i, key))
     handles = [Line2D([], [], color=c, marker="s", ls="", ms=5) for c in colors]
-    ax.legend(handles, labels, labelcolor=colors, fontsize=6.5, loc="upper right",
+    ax.legend(handles, labels, labelcolor=colors, fontsize=6.5, loc="lower right",
               handlelength=0, handletextpad=0.3, borderpad=0.3, framealpha=0.85)
 
 
