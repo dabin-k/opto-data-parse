@@ -27,10 +27,10 @@ import figures
 FS = dl.SAMPLE_RATE_HZ / 1000.0          # samples per ms
 PRE_MS = 0.33                             # always show this much before the trough
 LABEL_COLOR = {"putative E": "r", "putative I": "b", "neither": "0.5"}
-MICE = {"M150605": "/mnt/scratch/IChunData4Dabin/M150605_ICTP1",
-        "M150609A": "/mnt/scratch/IChunData4Dabin/M150609_ICTP1",
-        "M150609B": "/mnt/scratch/IChunData4Dabin/M150609_ICTP2",
-        "M151020": "/mnt/scratch/IChunData4Dabin/M151020_ICTP1",
+MICE = {"M150605": "/mnt/scratch/M150605_ICTP1",
+        "M150609A": "/mnt/scratch/M150609_ICTP1",
+        "M150609B": "/mnt/scratch/M150609_ICTP2",
+        "M151020": "/mnt/scratch/M151020_ICTP1",
         }
 
 def _uv(dw):

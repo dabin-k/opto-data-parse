@@ -28,9 +28,9 @@ as first-class, easily-configured inputs, so any session in this dataset — not
 ## Where things live
 | Concern | Location |
 |---|---|
-| Raw dataset (external, NOT in repo) | `/mnt/scratch/IChunData4Dabin/M150605_ICTP1/` |
-| Session-level files | `/mnt/scratch/IChunData4Dabin/M150605_ICTP1/1/` (manifest `.mat`, `.kwik`, `.kwx`) |
-| Per-experiment files | `/mnt/scratch/IChunData4Dabin/M150605_ICTP1/1/<exp>/` (`Protocol.mat`, `*_Timeline.mat`, `.ns5`, `.nev`) |
+| Raw dataset (external, NOT in repo) | `/mnt/scratch/M150605_ICTP1/` |
+| Session-level files | `/mnt/scratch/M150605_ICTP1/1/` (manifest `.mat`, `.kwik`, `.kwx`) |
+| Per-experiment files | `/mnt/scratch/M150605_ICTP1/1/<exp>/` (`Protocol.mat`, `*_Timeline.mat`, `.ns5`, `.nev`) |
 | Data-loading code | `data_loader.py` |
 | The paper | `lin_harris_mouse_corticothalamic_dynamical_equation.pdf` |
 | Daily journal | `journal/YYYY-MM-DD.md` *(convention to adopt; dir not yet created)* |
@@ -48,7 +48,7 @@ No project virtualenv — run against base.
 - Working branch: **master** (repo has **no commits yet** — the first commit will establish it).
 - Don't push to anything other than `master` without confirming first.
 - Commits: small, focused, descriptive. Use HEREDOC for multi-line commit messages.
-- Don't commit the dataset or large artifacts: `/mnt/scratch/IChunData4Dabin/...` is external; keep `__pycache__/`,
+- Don't commit the dataset or large artifacts: `/mnt/scratch/...` is external; keep `__pycache__/`,
   `.ns5`/`.dat`/`.kwd` and other large binaries out. There is no `.gitignore` yet — add one before
   the first commit (at minimum `__pycache__/`).
 - Commit or push only when the user asks.

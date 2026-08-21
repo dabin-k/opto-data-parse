@@ -485,7 +485,7 @@ def _pulse_mask(trial: dict, n_bins: int, pre_s: float, bin_s: float) -> np.ndar
 # ---------------------------------------------------------------------------
 
 def load_data(
-    base_dir: str | Path = "/mnt/scratch/IChunData4Dabin/M150605_ICTP1",
+    base_dir: str | Path = "/mnt/scratch/M150605_ICTP1",
     session: int = 1,
     pre_s: float = 0.5,
     post_s: float = 1.5,
@@ -1363,7 +1363,7 @@ def _pulse_experiments(
 
 
 def get_population_responses(
-    base_dir: str | Path = "/mnt/scratch/IChunData4Dabin/M150605_ICTP1",
+    base_dir: str | Path = "/mnt/scratch/M150605_ICTP1",
     session: int = 1,
     selected_exps: list[int] | None = None,
     pre_s: float = 0.5,

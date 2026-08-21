@@ -19,7 +19,7 @@ Session in hand: **M150605_ICTP1**, series/session 1. One mouse exercised so far
 - Extracellular 32-ch silicon probe, 30 kHz, Blackrock amplifier. Paired LGN recording (separate pipeline, not handled here).
 - **This session: 445 nm blue → E, 561 nm green → I** (mouse-line dependent; don't assume).
 
-## Dataset layout (external — `/mnt/scratch/IChunData4Dabin/.../M150605_ICTP1/`, NOT in repo)
+## Dataset layout (external — `/mnt/scratch/.../M150605_ICTP1/`, NOT in repo)
 
 Session dir `…/1/`:
 
@@ -84,11 +84,11 @@ Per-experiment dirs `…/1/<exp>/`:
 runs ~99 % full and a prior build hit ENOSPC there. The chain:
 
 ```
-<repo>/cache  ->  /mnt/scratch/IChunData4Dabin/_ichun_opto_cache      (live caches)
+<repo>/cache  ->  /mnt/scratch/_ichun_opto_cache      (live caches)
 ```
 
 Archived older caches (mcg0/mcg1 knn/wide, moved off root to free space) sit
-alongside at `/mnt/scratch/IChunData4Dabin/_ichun_opto_cache_archive/`. `cache/`
+alongside at `/mnt/scratch/_ichun_opto_cache_archive/`. `cache/`
 is in `.gitignore`, so only the symlink would ever be seen by git (and it isn't
 tracked). To relocate, repoint the symlink — code always resolves `CACHE_DIR`
 through it, so nothing else changes.

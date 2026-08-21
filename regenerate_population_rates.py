@@ -15,7 +15,7 @@ import numpy as np
 
 import data_loader
 
-ROOT = Path("/mnt/scratch/IChunData4Dabin")
+ROOT = Path("/mnt/scratch")
 ANIMALS = ["M150605_ICTP1", "M150609_ICTP1", "M150609_ICTP2", "M151020_ICTP1"]
 OUT_DIR = Path(__file__).parent / "results"
 N_FOLDS = 3       # paper's k for the mice we parse (see README exclusions)
