@@ -462,17 +462,21 @@ def _pulse_mask(trial: dict, n_bins: int, pre_s: float, bin_s: float) -> np.ndar
     intended duration and interpulse interval from Protocol.
     """
     s = np.zeros(n_bins, dtype=np.float32)
-    dur_s = trial["dur_ms"] / 1000.0
+    # dur_ms is a scalar (both pulses equal / single pulse) or a (d1, d2) tuple
+    # when the two pulses have different durations (2Dur variant).
+    dur = trial["dur_ms"]
+    d1_ms, d2_ms = dur if isinstance(dur, tuple) else (dur, dur)
 
-    def mark(t0_s: float) -> None:
+    def mark(t0_s: float, dur_ms: float) -> None:
+        dur_s = dur_ms / 1000.0
         lo = int(round((pre_s + t0_s) / bin_s))
         hi = int(round((pre_s + t0_s + dur_s) / bin_s))
         hi = max(hi, lo + 1)   # a sub-bin pulse (< bin_s) still marks one bin
         s[max(lo, 0):min(hi, n_bins)] = 1.0
 
-    mark(0.0)
+    mark(0.0, d1_ms)
     if trial["ipi_ms"] > 0:
-        mark(trial["ipi_ms"] / 1000.0)
+        mark(trial["ipi_ms"] / 1000.0, d2_ms)
     return s
 
 
@@ -1271,14 +1275,27 @@ def _load_protocol_conditions(
 
     pt_idx = parnames.index("pulseType")
     int_idx = parnames.index("intT")
-    dur_idx = parnames.index("durT")
+    # Duration parameter: either a single `durT` (both pulses equal) or, in the
+    # 2Dur variant, per-pulse `durT1`/`durT2` (durations stored as ms*10).
+    if "durT" in parnames:
+        dur1_idx = dur2_idx = parnames.index("durT")
+    else:
+        dur1_idx, dur2_idx = parnames.index("durT1"), parnames.index("durT2")
 
     conditions = {}
     for cond_i in range(p.npfilestimuli):
         cond_id = cond_i + 1   # 1-indexed to match mpepUDP events
         pt = int(pars[pt_idx, cond_i])
         ipi_ms = int(pars[int_idx, cond_i])
-        dur_ms = float(pars[dur_idx, cond_i]) / 10.0   # stored as ms*10
+        d1 = float(pars[dur1_idx, cond_i]) / 10.0   # stored as ms*10
+        d2 = float(pars[dur2_idx, cond_i]) / 10.0
+        # Single pulse (intT==0): only durT1 is delivered — durT2 is a vestigial
+        # default in the 2Dur variant, so drop it.  Paired: keep one value when
+        # both durations match, else a (d1, d2) tuple.
+        if ipi_ms == 0 or d1 == d2:
+            dur_ms = d1
+        else:
+            dur_ms = (d1, d2)
         if pt not in _PULSE_TYPE_WAVELENGTHS:
             continue
         pops = _pulse_populations(pt, wl_to_pop)
@@ -1307,7 +1324,13 @@ DEFAULT_PULSE_EXPS = [2, 3, 4, 5, 6, 7, 13]
 #: Protocol xfiles that are single/paired optogenetic pulse experiments (the E/I
 #: analysis subset).  Excludes regular-pulse trains (`stimRegPulsesWave`) and
 #: visual protocols (`ogl*`).
-_OPTO_PULSE_XFILES = {"stim2Pulses2Waves.x", "stim2PulsesRandNoise.x"}
+_OPTO_PULSE_XFILES = {
+    "stim2Pulses2Waves.x",
+    "stim2PulsesRandNoise.x",
+    # Variant where the two pulses may have *different* durations (durT1/durT2
+    # instead of a single durT).  Same E/I single/paired paradigm otherwise.
+    "stim2Pulses2DurRandNoise.x",
+}
 
 #: All valid experiment-type keys, in a canonical order.
 ALL_EXP_TYPES = ("single_E", "single_I", "paired_EE", "paired_II",
@@ -1539,8 +1562,13 @@ def get_population_responses(
             continue
 
         cond_dict = accum[exp_type]
-        # Sort conditions by (ipi_ms, dur_ms) for a consistent ordering
-        sorted_keys = sorted(cond_dict.keys(), key=lambda k: (k[1], k[2]))
+        # Sort conditions by (ipi_ms, dur_ms) for a consistent ordering.  dur_ms
+        # (k[2]) may be a scalar or a (d1, d2) tuple; normalise to a tuple so
+        # float-vs-tuple comparisons don't raise.
+        sorted_keys = sorted(
+            cond_dict.keys(),
+            key=lambda k: (k[1], k[2] if isinstance(k[2], tuple) else (k[2],)),
+        )
 
         responses_list = []
         conditions_list = []

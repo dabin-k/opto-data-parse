@@ -7,6 +7,11 @@ recordings were stored, and reproduce paper figures to prove we read them right.
 
 Session in hand: **M150605_ICTP1**, series/session 1. One mouse exercised so far.
 
+> **Session 1 only (current convention).** Every pipeline entry point defaults to
+> `session=1`, all outputs are named `_s1`, and no session-2 data has been built —
+> even where a dir has two (e.g. `M151020_ICTP1` has `/1` and `/2`; we cache `/1`).
+> `session` is a parameter throughout, so this is a convention for now. Maybe we'll change it in the future. 
+
 ## The experiment (V1, awake mouse)
 
 - Optogenetic pulses drive excitatory (E) or PV-inhibitory (I) populations.
@@ -66,14 +71,33 @@ Per-experiment dirs `…/1/<exp>/`:
 
 - `data_loader.py` — public API:
   - `load_data(...)` → `(trials, units, bins)` spike counts + stimulus + trial/unit info.
-  - `get_population_responses(...)` → trial-averaged, Hamming-smoothed, baseline-normalised E/I PSTHs per condition.
+  - `get_population_responses(...)` → **per-fold** trial-averaged, Hamming-smoothed, baseline-normalised E/I PSTHs per condition. Each condition's trials are randomly split into `n_folds` folds (default 3, seed `fold_seed`); `responses` is `(n_cond, n_folds, 2, n_bins)` and each condition records `n_trials_per_fold`. Train/test PSTHs are built downstream by averaging held-in folds vs. the held-out one (paper S1.10 k-fold CV).
 - `laser_timing.py` — parse `.ns5` (NEURALSG), auto-detect laser channels, return per-trial onsets.
 - `figures.py` — `plot_raw_traces_around_pulse()` reproduces Fig S1.B.
 - Run against miniconda **base** python. Needs the dataset mounted.
 
+## Cache (local, gitignored — lives on scratch)
+
+`data_loader.CACHE_DIR = <repo>/cache` holds the expensive derived caches
+(`knn_*`, `wide_*`, `ei_*` npz/npy — several GB per mouse). The repo `cache/` is
+**a symlink onto `/mnt/scratch`**, because the root fs (`/dev/sdd`, holds `/home`)
+runs ~99 % full and a prior build hit ENOSPC there. The chain:
+
+```
+<repo>/cache  ->  /mnt/scratch/IChunData4Dabin/_ichun_opto_cache      (live caches)
+```
+
+Archived older caches (mcg0/mcg1 knn/wide, moved off root to free space) sit
+alongside at `/mnt/scratch/IChunData4Dabin/_ichun_opto_cache_archive/`. `cache/`
+is in `.gitignore`, so only the symlink would ever be seen by git (and it isn't
+tracked). To relocate, repoint the symlink — code always resolves `CACHE_DIR`
+through it, so nothing else changes.
+
 ## Cross-mouse (how much generalises)
 
 Checked on 2 mice so far: **M150605A** and **M150609A** (both `M15060x_ICTP1`). Not yet verified on the rest.
+
+**Never parse `M150909C`, `M150823B`, `M150303B`.** The population-rates pipeline hard-codes 3-fold cross-validation (paper S1.10), but these three sessions used a different number of folds (paper p22). Rather than making `n_folds` per-mouse, we simply exclude them — the remaining sessions give enough data.
 
 Same across both (promising, unverified elsewhere):
 - `.ns5` = 36 ch = 32 neural + 4 analog (ids 129–132), **NEURALSG** format.
@@ -81,9 +105,18 @@ Same across both (promising, unverified elsewhere):
 - Manifest `not*` + `lims` scheme; `lims` == `.ns5` lengths.
 
 Differs per mouse (must be handled, not hardcoded):
-- Excluded experiment differs (`not9` vs `not1`) → manifest filename differs. Handled by `*_not*` glob.
-- Experiment numbers / layout differ → **pulse-exp list is derived per session** from each `Protocol.mat` `xfile`, not hardcoded.
+- Excluded experiment differs (`not9` vs `not1`) → manifest filename differs. Handled by matching the `_s{n}_*.mat` manifest that has a sibling `.kwik` (also covers the `_all`/`_sel` naming of M150609_ICTP2 / M151020).
+- Experiment numbers / layout differ → **pulse-exp list is derived per session** from each `Protocol.mat` `xfile` (`_OPTO_PULSE_XFILES`), not hardcoded.
 - Mouse line differs → **wavelength→E/I map comes from `mouse_lines.py`**, not a fixed B→E. (M150609 happens to match M150605; other lines differ, e.g. `PVcre;Ai32` = 445→I only.)
+- **Pulse-duration encoding differs.** Most sessions use `stim2PulsesRandNoise.x` /
+  `stim2Pulses2Waves.x` with a single `durT` (both pulses equal). M151020 uses
+  **`stim2Pulses2DurRandNoise.x`**, which has `durT1`/`durT2` — per-pulse durations.
+  **Assumption (undocumented in the data, taken as given):** this is the same E/I
+  single/paired paradigm, only the two pulses of a *pair* may differ in duration.
+  Loader treatment: single (`intT==0`) uses `durT1` only (durT2 is a vestigial
+  default); paired keeps a scalar `dur_ms` when `durT1==durT2`, else a `(d1, d2)`
+  tuple. Downstream (`conditions` json, plots) must accept `dur_ms` as scalar *or*
+  2-tuple.
 
 ## Known issues / uncertainties
 
