@@ -16,7 +16,7 @@ import numpy as np
 import data_loader
 
 ROOT = Path("/mnt/scratch/IChunData4Dabin")
-ANIMALS = ["M150605_ICTP1", "M150609_ICTP1"]
+ANIMALS = ["M150605_ICTP1", "M150609_ICTP1", "M150609_ICTP2", "M151020_ICTP1"]
 OUT_DIR = Path(__file__).parent / "results"
 N_FOLDS = 3       # paper's k for the mice we parse (see README exclusions)
 FOLD_SEED = 0     # fixes the random trial->fold split for reproducibility
@@ -28,6 +28,10 @@ def regenerate(animal_id: str) -> None:
         base_dir=base_dir, animal_id=animal_id,
         n_folds=N_FOLDS, fold_seed=FOLD_SEED,
     )
+    if not out:
+        print(f"SKIP {animal_id}: no pulse experiments / no responses — "
+              f"nothing written.", flush=True)
+        return
     flat: dict[str, np.ndarray] = {}
     for exp_type, res in out.items():
         flat[f"{exp_type}__responses"] = res["responses"]
