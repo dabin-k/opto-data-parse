@@ -31,25 +31,45 @@ INF = float("inf")
 # fw3m: real, hand-picked per mouse.
 # duration / early / late: PLACEHOLDER — fill in the real per-mouse cuts.  # TODO(dabin)
 _MOUSE_SPEC: dict[str, dict[str, dict[str, tuple[float, float]]]] = {
-    "M150605": {
-        "E": dict(duration=(0.6, 0.75),
+    "M150605_ICTP1": {
+        "E": dict(duration=(0.5, 0.8),
                   fw3m=(0.18, 0.30), # no clear bimodality 
-                  early=(-INF, 280.0),
+                  early=(-INF, 300.0),
                   late=(0.0, INF)),
-        "I": dict(duration=(0.2, 0.35),
+        "I": dict(duration=(0.22, 0.42),
                   fw3m=(0.08, 0.18), # no clear bimodality 
-                  early=(280.0, INF),
+                  early=(300.0, INF),
                   late=(-INF, 0.0)),
     },
-    "M150609": {
-        "E": dict(duration=(0.5, 0.90),   # no clear bimidality  
-                  fw3m=(0.3, 0.45),
-                  early=(-INF, 400.0), # no clear bimodality
+    "M150609_ICTP1": {
+        "E": dict(duration=(0.5, 0.8),  
+                  fw3m=(0.28, 0.45),
+                  early=(-INF, 400.0),
+                  late=(0.0, INF)), # no clear bimodality
+        "I": dict(duration=(0.15, 0.35),
+                  fw3m=(0.08, 0.2),
+                  early=(400.0, INF),
+                  late=(-INF, 0.0)), # no clear bimodality
+    },
+    "M150609_ICTP2": {
+        "E": dict(duration=(0.5, 0.8),
+                  fw3m=(0.2, 0.3), # intentionally overlapping
+                  early=(-INF, 400.0), # intentionally overlapping
                   late=(0.0, INF)), # no clear bimodality
         "I": dict(duration=(0.18, 0.35),
-                  fw3m=(0.08, 0.18),
-                  early=(400.0, INF), # no clear bimodality
+                  fw3m=(0.08, 0.25),
+                  early=(200.0, INF), # intentionally overlapping
                   late=(-INF, 0.0)), # no clear bimodality
+    },
+    "M151020_ICTP1": {
+        "E": dict(duration=(0.5, 0.80), 
+                  fw3m=(0.15, 0.28),
+                  early=(-INF, 400.0), # no clear bimodality
+                  late=(0.0, INF)),
+        "I": dict(duration=(0.18, 0.4),
+                  fw3m=(0.08, 0.18),
+                  early=(350.0, INF), # no clear bimodality
+                  late=(-INF, 0.0)),
     },
 }
 
