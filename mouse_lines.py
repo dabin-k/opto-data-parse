@@ -80,8 +80,11 @@ _MOUSE_LINE: dict[str, str] = {
 _MOUSE_ID_ALIASES: dict[str, str] = {
     "M150605_ICTP1": "M150605A",
     "M150609_ICTP1": "M150609A",
+    "M150609_ICTP2": "M150609B",
+    # Only M151020 dir; two sessions (s1/s2). Table S2's M151020A.
+    "M151020_ICTP1": "M151020A",
     # Add more session-dir -> Table S2 ID as they are verified.  The ICTP1 -> "A"
-    # correspondence is confirmed for these two; do not assume it for others.
+    # correspondence is confirmed for these; do not assume it for others.
 }
 
 

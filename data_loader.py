@@ -188,29 +188,34 @@ def _find_session_files(
     Locate manifest, kwik, and kwx files for a session.
 
     Manifest (*.mat) and kwik/kwx may live in session_dir or _klustakwik/.
-    Prefers a 'not*' manifest over 'V1' when both exist, because the not*
-    variant is the one that feeds SpikeDetekt.
+    The manifest suffix varies per session (`not9`, `all`, `sel`, …): it names
+    the experiment-selection the spikes were sorted on, and its `lims` must match
+    the `.kwik`'s concatenation.  So we pick the `{animal}_s{n}_*.mat` whose stem
+    has a matching `.kwik`, deprioritising the `V1` (visual-only) manifest, which
+    is a different selection and normally carries no kwik.
 
     Returns (kwik_path, kwx_path, manifest_path).
     """
-    not_mats = sorted(session_dir.glob(f"{animal_id}_s{session}_not*.mat"))
-    v1_mats  = sorted(session_dir.glob(f"{animal_id}_s{session}_V1.mat"))
-    candidates = not_mats or v1_mats
-    if not candidates:
+    mats = sorted(session_dir.glob(f"{animal_id}_s{session}_*.mat"))
+    # Stable sort pushing the V1 manifest last; matching-kwik requirement below
+    # then selects the sorted-on manifest (not9/all/sel/…) over V1.
+    mats.sort(key=lambda p: p.stem.endswith("_V1"))
+    if not mats:
         raise FileNotFoundError(
             f"No manifest MAT found in {session_dir} for {animal_id} s{session}"
         )
-    manifest_path = candidates[0]
-    stem = manifest_path.stem   # e.g. M150605_ICTP1_s1_not9
 
-    for search_dir in (session_dir, session_dir / "_klustakwik"):
-        kwik = search_dir / f"{stem}.kwik"
-        if kwik.exists():
-            kwx = search_dir / f"{stem}.kwx"
-            return kwik, kwx, manifest_path
+    for manifest_path in mats:
+        stem = manifest_path.stem   # e.g. M150605_ICTP1_s1_not9, …_s1_all
+        for search_dir in (session_dir, session_dir / "_klustakwik"):
+            kwik = search_dir / f"{stem}.kwik"
+            if kwik.exists():
+                return kwik, search_dir / f"{stem}.kwx", manifest_path
 
+    stems = ", ".join(p.stem for p in mats)
     raise FileNotFoundError(
-        f"kwik file '{stem}.kwik' not found in {session_dir} or _klustakwik/"
+        f"No manifest MAT with a matching .kwik in {session_dir} or "
+        f"_klustakwik/ for {animal_id} s{session} (tried: {stems})"
     )
 
 # ---------------------------------------------------------------------------
