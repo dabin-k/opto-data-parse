@@ -1,6 +1,7 @@
 """
 Regenerate the saved `results/population_rates_<animal>_s1.npz` files from
-`data_loader.get_population_responses` (now 1 ms default bin).
+`data_loader.get_population_responses` (1 ms bin, unsmoothed by default —
+set `HAMMING_MS = 40.0` for the paper's Hamming-smoothed PSTHs).
 
 Flat npz layout expected by `figures.plot_population_rates`:
     {type}__responses  : float64 (n_cond, n_folds, 2, n_bins)
@@ -20,13 +21,18 @@ ANIMALS = ["M150605_ICTP1", "M150609_ICTP1", "M150609_ICTP2", "M151020_ICTP1"]
 OUT_DIR = Path(__file__).parent / "results"
 N_FOLDS = 3       # paper's k for the mice we parse (see README exclusions)
 FOLD_SEED = 0     # fixes the random trial->fold split for reproducibility
+# Store raw trial-averaged rates by default; a symmetric Hamming window smears the
+# evoked transient ~half its width before the pulse (see the onset-alignment check),
+# so we keep the unsmoothed rates and leave any smoothing to downstream consumers.
+# Set to 40.0 to reproduce the paper's 40 ms Hamming-smoothed PSTHs.
+HAMMING_MS = 0.0
 
 
-def regenerate(animal_id: str) -> None:
+def regenerate(animal_id: str, hamming_ms: float = HAMMING_MS) -> None:
     base_dir = ROOT / animal_id
     out = data_loader.get_population_responses(
         base_dir=base_dir, animal_id=animal_id,
-        n_folds=N_FOLDS, fold_seed=FOLD_SEED,
+        n_folds=N_FOLDS, fold_seed=FOLD_SEED, hamming_ms=hamming_ms,
     )
     if not out:
         print(f"SKIP {animal_id}: no pulse experiments / no responses — "

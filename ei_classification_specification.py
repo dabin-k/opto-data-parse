@@ -33,7 +33,7 @@ INF = float("inf")
 _MOUSE_SPEC: dict[str, dict[str, dict[str, tuple[float, float]]]] = {
     "M150605_ICTP1": {
         "E": dict(duration=(0.5, 0.8),
-                  fw3m=(0.18, 0.30), # no clear bimodality 
+                  fw3m=(0.15, 0.30), # no clear bimodality 
                   early=(-INF, 300.0),
                   late=(0.0, INF)),
         "I": dict(duration=(0.22, 0.42),
@@ -63,7 +63,7 @@ _MOUSE_SPEC: dict[str, dict[str, dict[str, tuple[float, float]]]] = {
     },
     "M151020_ICTP1": {
         "E": dict(duration=(0.5, 0.80), 
-                  fw3m=(0.15, 0.28),
+                  fw3m=(0.15, 0.30),
                   early=(-INF, 400.0), # no clear bimodality
                   late=(0.0, INF)),
         "I": dict(duration=(0.18, 0.4),
