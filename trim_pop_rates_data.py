@@ -27,6 +27,7 @@ Note the `__conditions` field is a *single* 0-d JSON string, not an array of
 n_cond entries — so it has to be json-decoded, sliced as a list, then re-encoded.
 Slicing the 0-d array directly (the original bug) does nothing.
 """
+import argparse
 import json
 from pathlib import Path
 
@@ -63,39 +64,55 @@ def _filter_type(data, c):
     return data[f"{c}__responses"][mask], kept
 
 
-# Pass 1: filter the reference session and record its post-filter per-type counts.
-compare = np.load(RESULTS / f"population_rates_{COMPARE}_s1.npz", allow_pickle=True)
-keep_counts = {c: len(_filter_type(compare, c)[1]) for c in all_conditions}
-print(f"reference {COMPARE} post-filter counts: {keep_counts} "
-      f"(total {sum(keep_counts.values())})")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--trim_smooth", action="store_true",
+        help="trim smoothed_population_rates_*_s1.npz files instead of the raw "
+             "population_rates_*_s1.npz files")
+    args = parser.parse_args()
 
-# Pass 2: apply the filter to every mouse, count-match the richer sessions, write.
-for animal in ANIMALS:
-    src = np.load(RESULTS / f"population_rates_{animal}_s1.npz", allow_pickle=True)
-    new_data = {}
-    n_conds = 0
-    print(f"=== {animal} ===")
-    for c in all_conditions:
-        resp, kept = _filter_type(src, c)
-        n_keep = keep_counts[c]
-        if len(kept) > n_keep:
-            # Richer session (M151020) — trim to the reference count.
-            resp, kept = resp[:n_keep], kept[:n_keep]
-        elif len(kept) < n_keep:
-            # Don't invent conditions — keep what we have and flag it.
-            print(f"  Warning: {c} has {len(kept)} < reference {n_keep}; keeping all.")
-        print(f"  {c:12s} keep {len(kept)}")
+    # The two variants differ only in the filename stem; layout is identical.
+    prefix = "smoothed_population_rates" if args.trim_smooth else "population_rates"
 
-        new_data[f"{c}__responses"] = resp
-        new_data[f"{c}__time_axis"] = src[f"{c}__time_axis"]
-        new_data[f"{c}__conditions"] = np.array(json.dumps(kept))
-        n_conds += len(kept)
+    # Pass 1: filter the reference session, record its post-filter per-type counts.
+    compare = np.load(RESULTS / f"{prefix}_{COMPARE}_s1.npz", allow_pickle=True)
+    keep_counts = {c: len(_filter_type(compare, c)[1]) for c in all_conditions}
+    print(f"reference {COMPARE} post-filter counts: {keep_counts} "
+          f"(total {sum(keep_counts.values())})")
 
-    # Carry provenance through unchanged so each trimmed file still records how
-    # its E/I labels and folds were produced.
-    for k in ("ei_cache_key", "n_folds", "fold_seed"):
-        new_data[k] = src[k]
+    # Pass 2: apply the filter to every mouse, count-match richer sessions, write.
+    for animal in ANIMALS:
+        src = np.load(RESULTS / f"{prefix}_{animal}_s1.npz", allow_pickle=True)
+        new_data = {}
+        n_conds = 0
+        print(f"=== {animal} ===")
+        for c in all_conditions:
+            resp, kept = _filter_type(src, c)
+            n_keep = keep_counts[c]
+            if len(kept) > n_keep:
+                # Richer session (M151020) — trim to the reference count.
+                resp, kept = resp[:n_keep], kept[:n_keep]
+            elif len(kept) < n_keep:
+                # Don't invent conditions — keep what we have and flag it.
+                print(f"  Warning: {c} has {len(kept)} < reference {n_keep}; keeping all.")
+            print(f"  {c:12s} keep {len(kept)}")
 
-    out_path = RESULTS / f"population_rates_{animal}_s1_trimmed.npz"
-    np.savez(out_path, **new_data)
-    print(f"  total sub-conditions: {n_conds}  ->  {out_path.name}")
+            new_data[f"{c}__responses"] = resp
+            new_data[f"{c}__time_axis"] = src[f"{c}__time_axis"]
+            new_data[f"{c}__conditions"] = np.array(json.dumps(kept))
+            n_conds += len(kept)
+
+        # Carry provenance through unchanged so each trimmed file still records
+        # how its E/I labels and folds were produced.
+        for k in ("ei_cache_key", "n_folds", "fold_seed"):
+            new_data[k] = src[k]
+
+        out_path = RESULTS / f"{prefix}_{animal}_s1_trimmed.npz"
+        np.savez(out_path, **new_data)
+        print(f"  total sub-conditions: {n_conds}  ->  {out_path.name}")
+
+
+if __name__ == "__main__":
+    main()

@@ -25,7 +25,7 @@ FOLD_SEED = 0     # fixes the random trial->fold split for reproducibility
 # evoked transient ~half its width before the pulse (see the onset-alignment check),
 # so we keep the unsmoothed rates and leave any smoothing to downstream consumers.
 # Set to 40.0 to reproduce the paper's 40 ms Hamming-smoothed PSTHs.
-HAMMING_MS = 0.0
+HAMMING_MS = 5.0
 
 
 def regenerate(animal_id: str, hamming_ms: float = HAMMING_MS) -> None:
@@ -49,7 +49,11 @@ def regenerate(animal_id: str, hamming_ms: float = HAMMING_MS) -> None:
     # Fold provenance: n_folds + the seed that fixed the random trial split.
     flat["n_folds"] = np.array(N_FOLDS)
     flat["fold_seed"] = np.array(FOLD_SEED)
-    out_path = OUT_DIR / f"population_rates_{animal_id}_s1.npz"
+    if hamming_ms > 0.0:
+        # out_path = OUT_DIR / f"h{hamming_ms:.0f}_smoothed_population_rates_{animal_id}_s1.npz"
+        out_path = OUT_DIR / f"smoothed_population_rates_{animal_id}_s1.npz"
+    else:
+        out_path = OUT_DIR / f"population_rates_{animal_id}_s1.npz"
     np.savez(out_path, **flat)
     n_bins = next(iter(out.values()))["time_axis"].shape[0]
     print(f"wrote {out_path}  ({len(out)} types, n_bins={n_bins}, "
