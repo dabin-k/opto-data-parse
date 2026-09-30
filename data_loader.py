@@ -1368,7 +1368,7 @@ def get_population_responses(
     selected_exps: list[int] | None = None,
     pre_s: float = 0.5,
     post_s: float = 1.5,
-    bin_s: float = 0.001,
+    bin_samples: int = 30,
     hamming_ms: float = 40.0,
     baseline_window: tuple[float, float] = (-0.5, -0.1),
     min_cluster_group: int = 2,
@@ -1405,12 +1405,14 @@ def get_population_responses(
         (`ogl*`) and regular-pulse (`stimRegPulsesWave`) experiments are excluded.
     pre_s, post_s : float
         Trial window around stimulus onset (seconds).
-    bin_s : float
-        Spike-count bin width (seconds).  Default 1 ms.  The paper bins at the
-        1/30 ms sample period before smoothing; at the 40 ms Hamming window used
-        here, 1 ms is empirically indistinguishable from 0.2 ms and finer, while
-        5 ms visibly clips/mis-times the fast onset transient in short-IPI
-        conditions.  The output keeps only 2 populations, so fine bins are cheap.
+    bin_samples : int
+        Spike-count bin width in sampling intervals of the 30 kHz recording clock
+        (`SAMPLE_RATE_HZ`), so bins align exactly with the integer spike times.
+        Default 30 (= 1 ms).  The paper bins at the 1/30 ms sample period before
+        smoothing; at the 40 ms Hamming window, 1 ms is empirically
+        indistinguishable from 0.2 ms and finer, while 5 ms visibly clips/mis-times
+        the fast onset transient in short-IPI conditions.  `pre_s` must span a
+        whole number of bins so that stimulus onset falls on a bin edge.
     hamming_ms : float
         Hamming smoothing window width (milliseconds).  Paper uses 40 ms.
     baseline_window : (float, float)
@@ -1490,8 +1492,17 @@ def get_population_responses(
     wl_to_pop = _wavelength_to_pop(animal_id)   # for per-condition E/I labels
 
     # --- time axis and Hamming kernel ---------------------------------------
-    n_bins = int(round((pre_s + post_s) / bin_s))
-    bin_edges = np.linspace(-pre_s, post_s, n_bins + 1)
+    # Bin in integer samples: spike times are integer sample indices, so this is
+    # exact (no float-truncation at bin edges).
+    pre_samples = int(round(pre_s * SAMPLE_RATE_HZ))
+    post_samples = int(round(post_s * SAMPLE_RATE_HZ))
+    if pre_samples % bin_samples:
+        # Otherwise every post-stimulus bin straddles onset and is silently misaligned.
+        raise ValueError(f"pre_s = {pre_samples} samples is not a multiple of "
+                         f"bin_samples = {bin_samples}; onset would not be a bin edge")
+    bin_s = bin_samples / SAMPLE_RATE_HZ
+    n_bins = (pre_samples + post_samples) // bin_samples   # trailing partial bin dropped
+    bin_edges = (np.arange(n_bins + 1) * bin_samples - pre_samples) / SAMPLE_RATE_HZ
     time_axis = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
     hamming_bins = max(1, int(round(hamming_ms / 1000.0 / bin_s)))
@@ -1522,16 +1533,15 @@ def get_population_responses(
         for trial in trials:
             exp_type = trial["exp_type"]
             onset_sample = exp_start + trial["onset_sample"]
-            win_start = max(onset_sample - int(pre_s * SAMPLE_RATE_HZ), exp_start)
-            win_end   = min(onset_sample + int(post_s * SAMPLE_RATE_HZ), exp_end)
+            win_start = max(onset_sample - pre_samples, exp_start)
+            win_end   = min(onset_sample + post_samples, exp_end)
 
             counts = np.zeros((2, n_bins), dtype=np.float32)
             for pop_idx, st in enumerate((e_times, i_times)):
                 lo = int(np.searchsorted(st, win_start))
                 hi = int(np.searchsorted(st, win_end))
                 if lo < hi:
-                    spike_t = (st[lo:hi].astype(np.float64) - onset_sample) / SAMPLE_RATE_HZ
-                    bin_idx = ((spike_t + pre_s) / bin_s).astype(np.int32)
+                    bin_idx = (st[lo:hi] - onset_sample + pre_samples) // bin_samples
                     valid = (bin_idx >= 0) & (bin_idx < n_bins)
                     np.add.at(counts[pop_idx], bin_idx[valid], 1.0)
 

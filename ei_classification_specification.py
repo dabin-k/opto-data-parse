@@ -71,6 +71,27 @@ _MOUSE_SPEC: dict[str, dict[str, dict[str, tuple[float, float]]]] = {
                   early=(350.0, INF), # no clear bimodality
                   late=(-INF, 0.0)),
     },
+    # "M150909_ICTP3": {
+    #     "E": dict(duration=(0.5, 0.80), 
+    #               fw3m=(0.15, 0.30),
+    #               early=(-INF, 400.0), # no clear bimodality
+    #               late=(0.0, INF)),
+    #     "I": dict(duration=(0.18, 0.4),
+    #               fw3m=(0.08, 0.18),
+    #               early=(350.0, INF), # no clear bimodality
+    #               late=(-INF, 0.0)),
+    # },
+    "M150823_ICTP2": {
+        "E": dict(duration=(0.5, 0.80), 
+                  fw3m=(0.15, 0.30),
+                  early=(-INF, 400.0), # no clear bimodality
+                  late=(0.0, INF)),
+        "I": dict(duration=(0.18, 0.4),
+                  fw3m=(0.08, 0.18),
+                  early=(350.0, INF), # no clear bimodality
+                  late=(-INF, 0.0)),
+    },
+
 }
 
 

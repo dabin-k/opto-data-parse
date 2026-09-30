@@ -83,6 +83,8 @@ _MOUSE_ID_ALIASES: dict[str, str] = {
     "M150609_ICTP2": "M150609B",
     # Only M151020 dir; two sessions (s1/s2). Table S2's M151020A.
     "M151020_ICTP1": "M151020A",
+    "M150909_ICTP3" : "M150909C", 
+    "M150823_ICTP2": "M150823B",
     # Add more session-dir -> Table S2 ID as they are verified.  The ICTP1 -> "A"
     # correspondence is confirmed for these; do not assume it for others.
 }

@@ -8,6 +8,9 @@ Live in `results/`.
 - `population_rates_<animal_id>_s<session>.npz`
 - `<animal_id>` = mouse + protocol, e.g. `M150605_ICTP1`, `M150609_ICTP2`, `M151020_ICTP1`.
 - Session is always `s1` so far.
+- `b<N>_population_rates_<animal_id>_s1.npz` = binned at `N` sampling intervals
+  (see "Bin width" below), e.g. `b300_` = 10 ms bins. Files without a `b<N>_` tag
+  predate this and are 1 ms bins (`N = 30`).
 - Default files are **unsmoothed** (trial-averaged raw rates). The `smoothed_*`
   prefixed files are the paper's 40 ms Hamming-smoothed version, kept for reference.
   A symmetric Hamming window smears the evoked transient ~half its width *before*
@@ -28,6 +31,7 @@ Plus provenance scalars (0-d arrays):
 - `ei_cache_key` — str, the classified-cache key (session + boxes + classification version) that produced the E/I labels.
 - `n_folds` — int, number of CV folds (3).
 - `fold_seed` — int, RNG seed fixing the trial→fold split (0).
+- `bin_samples` — int, bin width in sampling intervals (absent from untagged 1 ms files).
 
 ## Shape of responses
 `{type}__responses` shape `(n_conditions, n_folds, 2, n_bins)`:
@@ -41,8 +45,22 @@ mean rate in −0.5 to −0.1 s, so baseline ≈ 1.0). Default files are unsmoot
 `smoothed_*` files additionally apply a 40 ms Hamming window before normalising.
 A fold with no trials (condition with fewer trials than `n_folds`) is all-NaN.
 
-`time_axis`: seconds relative to pulse onset. Default window −0.5 to +1.5 s,
-1 ms bins → 2000 bins, centres −0.4995 … +1.4995.
+`time_axis`: seconds relative to pulse onset. Default window −0.5 to +1.5 s.
+Pulse onset (0 s) is always a bin edge. For example, 1 ms bins (`bin_samples = 30`)
+→ 2000 bins, centres −0.4995 … +1.4995; 10 ms bins (`bin_samples = 300`) → 200
+bins, centres −0.495 … +1.495.
+
+## Bin width
+Spikes are timestamped on the **30 kHz** recording clock (`data_loader.SAMPLE_RATE_HZ`),
+as integer sample indices. Bin width is therefore chosen as `bin_samples`, an integer
+number of 1/30 ms sampling intervals (`BIN_SAMPLES` in `regenerate_population_rates.py`),
+and spikes are binned exactly in integer arithmetic. The user converts a desired
+duration to samples (duration_s × 30 000). `bin_samples` must divide the 0.5 s
+pre-onset window (15 000 samples), or `get_population_responses` raises; a trailing
+partial bin at the end of the window is dropped. Each value is the trial-averaged
+mean rate within the bin (spike count / bin duration), then baseline-normalised.
+Paired IPIs shorter than the bin width (e.g. 5, 8 ms at 10 ms bins) land both pulses
+in one bin.
 
 ## k-fold splitting logic
 - Per condition, trials are permuted with `np.random.default_rng(fold_seed)` then split by `np.array_split(perm, n_folds)`.

@@ -31,6 +31,8 @@ MICE = {"M150605": "/mnt/scratch/M150605_ICTP1",
         "M150609A": "/mnt/scratch/M150609_ICTP1",
         "M150609B": "/mnt/scratch/M150609_ICTP2",
         "M151020": "/mnt/scratch/M151020_ICTP1",
+        # "M150909" : "/mnt/scratch/M150909_ICTP3",
+        "M150823" : "/mnt/scratch/M150823_ICTP2"
         }
 
 def _uv(dw):

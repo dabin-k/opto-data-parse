@@ -34,10 +34,17 @@ _POPS = [("E", "tab:blue"), ("I", "tab:red")]
 _TYPES = ["single_E", "single_I", "paired_EE", "paired_II", "paired_EI", "paired_IE"]
 
 
-def _load(animal_id, session=1, full=False, plot_smooth=False):
-    prefix = "FULL_" if full else ""
+def _load(animal_id, session=1, full=False, plot_smooth=False, plot_binned=False):
+    prefix = ""
+    if plot_smooth:
+        prefix = "smoothed_"
+    elif plot_binned:
+        prefix = "b300_"
+    
+    if full:
+        prefix += "FULL_"
     return np.load(
-        f"results/{'smoothed_' if plot_smooth else ''}{prefix}population_rates_{animal_id}_s{session}.npz",
+        f"results/{prefix}population_rates_{animal_id}_s{session}.npz",
         allow_pickle=True,
     )
 
@@ -74,7 +81,7 @@ def _stim_spans(c):
     return spans
 
 
-def _plot_type(d, type_name, animal_id, plot_smooth):
+def _plot_type(d, type_name, animal_id, plot_smooth, plot_binned):
     resp = d[f"{type_name}__responses"]            # (n_cond, n_folds, 2, n_bins)
     t = d[f"{type_name}__time_axis"]
     conds = json.loads(str(d[f"{type_name}__conditions"]))
@@ -113,6 +120,8 @@ def _plot_type(d, type_name, animal_id, plot_smooth):
     # M150609 protocols (ICTP1/ICTP2) stay distinct within the same folder.
     if plot_smooth:
         out_dir = f"results/population_rates_plots/{animal_id.split('_')[0]}"
+    elif plot_binned:
+        out_dir = f"results/population_rates_plots/{animal_id.split('_')[0]}_BINNED"
     else:
         out_dir = f"results/population_rates_plots/{animal_id.split('_')[0]}_UNSMOOTHED"
     os.makedirs(out_dir, exist_ok=True)
@@ -126,13 +135,14 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     full = "--full" in sys.argv[1:]
     plot_smooth = "--plot_smooth" in sys.argv[1:]
+    plot_binned = "--plot_binned" in sys.argv[1:]
     animal_id = args[0] if args else "M150605_ICTP1"
 
-    d = _load(animal_id, full=full, plot_smooth=plot_smooth)
+    d = _load(animal_id, full=full, plot_smooth=plot_smooth, plot_binned=plot_binned)
     for type_name in _TYPES:
         if f"{type_name}__responses" not in d:
             continue
-        print("wrote", _plot_type(d, type_name, animal_id, plot_smooth))
+        print("wrote", _plot_type(d, type_name, animal_id, plot_smooth, plot_binned))
 
 
 if __name__ == "__main__":
