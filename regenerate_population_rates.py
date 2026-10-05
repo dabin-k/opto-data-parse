@@ -64,7 +64,7 @@ def regenerate(animal_id: str, hamming_ms: float = HAMMING_MS,
     if hamming_ms > 0.0:
         # out_path = OUT_DIR / f"h{hamming_ms:.0f}_smoothed_population_rates_{animal_id}_s1.npz"
         out_path = OUT_DIR / f"smoothed_b{bin_samples}_population_rates_{animal_id}_s1.npz"
-    else:
+    elif hamming_ms == 0.0 and bin_samples > 1:
         out_path = OUT_DIR / f"b{bin_samples}_population_rates_{animal_id}_s1.npz"
     np.savez(out_path, **flat)
     n_bins = next(iter(out.values()))["time_axis"].shape[0]
