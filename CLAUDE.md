@@ -67,6 +67,9 @@ No project virtualenv — run against base.
 - Each day starts with creating `journal/YYYY-MM-DD.md` with the aims list.
 - After each substantive task, update the journal's "Done" section with what changed and why —
   especially any new conclusion about how a file is stored.
+- When it is required to run a new task that is expected to take many minutes (> 5mins), check with
+  the user first whether it is worth running it. It might be the case that we want to skip it / reorder 
+  the plan (e.g. run the time consuming jobs later/ just run a proof of concept check, etc)
 - End-of-day: write the "Next" section so the next session (or agent) knows where to pick up.
 
 ### Before non-trivial changes

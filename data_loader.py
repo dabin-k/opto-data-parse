@@ -20,14 +20,25 @@ and `Protocol.mat` are still used, but only to label *what* each trial was:
 each measured laser onset is matched to a Timeline trial by relative timing, and
 that trial's `cond_id` is looked up in `Protocol.mat`.
 
-Two public functions
---------------------
+Public functions
+----------------
+get_trial_counts()
+    Single-trial E/I population spike counts for one session as a flat trial
+    table: counts (n_trials, 2, n_bins) plus per-trial and per-condition arrays.
+    No averaging / smoothing / normalisation — the primary output.
+
+get_trial_margins(), window_trial_loss(), trial_spacing_summary()
+    Per-trial time available around each onset (no spikes loaded), what a
+    candidate (pre_s, post_s) window would cost, and per-type window length
+    needed vs. shortest inter-trial gap — for choosing the window.
+
 load_data()
     Returns per-unit (cluster-level) spike counts aligned to trial onsets.
     Shape: (n_trials, n_units, n_bins).
 
 get_population_responses()
-    Returns trial-averaged, baseline-normalised, Hamming-smoothed population
+    LEGACY (feeds the old `*population_rates_*.npz` files; prefer
+    get_trial_counts and average downstream).  Returns per-fold trial-averaged, baseline-normalised, Hamming-smoothed population
     activity for E and I populations, organised by experiment type.
     Shape per type: (n_conditions, 2, n_bins).
 
@@ -1160,10 +1171,7 @@ def ei_cache_key(
     """
     base_dir = Path(base_dir)
     animal_id = animal_id or base_dir.name
-    if box_e is None or box_i is None:
-        default_e, default_i = _mouse_ei_boxes(animal_id)
-        box_e = default_e if box_e is None else box_e
-        box_i = default_i if box_i is None else box_i
+    box_e, box_i = _resolve_boxes(animal_id, box_e, box_i)
     _, kwx_path, _ = _find_session_files(base_dir / str(session), animal_id, session)
     return _ei_cache_key(kwx_path.stem, min_cluster_group, box_e, box_i)
 
@@ -1362,6 +1370,154 @@ def _pulse_experiments(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Shared session / trial helpers for the population-level API
+# ---------------------------------------------------------------------------
+
+def _resolve_boxes(animal_id: str, box_e: dict | None,
+                   box_i: dict | None) -> tuple[dict, dict]:
+    """Per-mouse E/I boxes (full four-metric spec) unless the caller overrode one."""
+    if box_e is None or box_i is None:
+        default_e, default_i = _mouse_ei_boxes(animal_id)
+        box_e = default_e if box_e is None else box_e
+        box_i = default_i if box_i is None else box_i
+    return box_e, box_i
+
+
+def _session_layout(
+    base_dir: str | Path,
+    session: int,
+    animal_id: str | None,
+    selected_exps: list[int] | None,
+) -> dict:
+    """
+    Session files and the concatenated-recording span of each selected experiment
+    — everything except spikes, so trial timing can be inspected cheaply.
+
+    Returns dict with
+        animal_id, session, session_dir, kwik_path, kwx_path, wl_to_pop,
+        exps    list of (exp_num, exp_start, exp_end) for the selected experiments,
+                in recording order (samples in the concatenated-recording clock)
+    """
+    base_dir = Path(base_dir)
+    if animal_id is None:
+        animal_id = base_dir.name
+    session_dir = base_dir / str(session)
+    kwik_path, kwx_path, manifest_path = _find_session_files(
+        session_dir, animal_id, session
+    )
+
+    # Segment boundaries: `lims` are per-experiment lengths in the concatenation.
+    manifest = scipy.io.loadmat(str(manifest_path), squeeze_me=True)
+    lims: np.ndarray = manifest["lims"].astype(np.int64)
+    all_exps: np.ndarray = manifest["SELECTED_EXPERIMENTS"].astype(int)
+    exp_start_samples = np.concatenate([[0], np.cumsum(lims)])
+
+    if selected_exps is None:
+        selected_exps = _pulse_experiments(session_dir, list(all_exps), animal_id)
+        print(f"pulse experiments (from Protocol xfiles): {selected_exps}")
+    exps = [(int(e), int(exp_start_samples[i]), int(exp_start_samples[i + 1]))
+            for i, e in enumerate(all_exps) if e in selected_exps]
+
+    return dict(animal_id=animal_id, session=session, session_dir=session_dir,
+                kwik_path=kwik_path, kwx_path=kwx_path,
+                wl_to_pop=_wavelength_to_pop(animal_id), exps=exps)
+
+
+def _load_session(
+    base_dir: str | Path,
+    session: int,
+    animal_id: str | None,
+    selected_exps: list[int] | None,
+    min_cluster_group: int,
+    box_e: dict | None,
+    box_i: dict | None,
+) -> dict:
+    """
+    `_session_layout` plus the classified E/I spike trains:
+        e_times, i_times   sorted int spike samples (concatenated-recording clock)
+        ei_cache_key
+    """
+    sess = _session_layout(base_dir, session, animal_id, selected_exps)
+    box_e, box_i = _resolve_boxes(sess["animal_id"], box_e, box_i)
+
+    print("Loading and classifying spikes …")
+    pop_times, pop_labels = _load_population_spikes(
+        sess["kwik_path"], sess["kwx_path"], min_cluster_group, box_e, box_i
+    )
+    print(f"  {(pop_labels==0).sum():,} E spikes,  {(pop_labels==1).sum():,} I spikes")
+
+    sess.update(
+        ei_cache_key=_ei_cache_key(sess["kwx_path"].stem, min_cluster_group, box_e, box_i),
+        e_times=pop_times[pop_labels == 0],   # wide / excitatory
+        i_times=pop_times[pop_labels == 1],   # narrow / inhibitory
+    )
+    return sess
+
+
+def _trial_bins(
+    pre_s: float, post_s: float, bin_samples: int
+) -> tuple[int, int, int, np.ndarray]:
+    """
+    Trial window in integer samples → (pre_samples, post_samples, n_bins, time_axis).
+
+    Binning in integer samples is exact because spike times are integer sample
+    indices (no float truncation at bin edges).  `time_axis` holds bin centres in
+    seconds relative to onset; a trailing partial bin is dropped.
+    """
+    pre_samples = int(round(pre_s * SAMPLE_RATE_HZ))
+    post_samples = int(round(post_s * SAMPLE_RATE_HZ))
+    if pre_samples % bin_samples:
+        # Otherwise every post-stimulus bin straddles onset and is silently misaligned.
+        raise ValueError(f"pre_s = {pre_samples} samples is not a multiple of "
+                         f"bin_samples = {bin_samples}; onset would not be a bin edge")
+    n_bins = (pre_samples + post_samples) // bin_samples
+    bin_edges = (np.arange(n_bins + 1) * bin_samples - pre_samples) / SAMPLE_RATE_HZ
+    time_axis = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    return pre_samples, post_samples, n_bins, time_axis
+
+
+def _iter_trials(sess: dict, pre_samples: int, post_samples: int):
+    """
+    Yield one dict per laser trial of the selected experiments, in recording order:
+        exp_num, trial_in_exp, trial (from `_load_experiment_trials`),
+        onset_abs           onset in the concatenated-recording clock
+        win_start, win_end  window clipped to the experiment's own span
+        complete            False if clipping removed part of the window
+
+    Clipping matters because spikes outside an experiment's span belong to the
+    neighbouring experiment in the concatenation, not to this trial.
+    """
+    for exp_num, exp_start, exp_end in sess["exps"]:
+        trials = _load_experiment_trials(sess["session_dir"], exp_num, sess["animal_id"])
+        if not trials:
+            print(f"  exp {exp_num}: no laser trials, skipping")
+            continue
+        print(f"  exp {exp_num}: {len(trials)} trials")
+        for k, trial in enumerate(trials):
+            onset_abs = exp_start + trial["onset_sample"]
+            lo, hi = onset_abs - pre_samples, onset_abs + post_samples
+            yield dict(exp_num=exp_num, trial_in_exp=k, trial=trial,
+                       onset_abs=onset_abs,
+                       win_start=max(lo, exp_start), win_end=min(hi, exp_end),
+                       complete=(lo >= exp_start and hi <= exp_end))
+
+
+def _bin_trial(
+    sess: dict, onset_abs: int, win_start: int, win_end: int,
+    pre_samples: int, bin_samples: int, n_bins: int,
+) -> np.ndarray:
+    """E/I spike counts (2, n_bins) int64 for one trial window."""
+    counts = np.zeros((2, n_bins), dtype=np.int64)
+    for pop_idx, st in enumerate((sess["e_times"], sess["i_times"])):
+        lo = int(np.searchsorted(st, win_start))
+        hi = int(np.searchsorted(st, win_end))
+        bin_idx = (st[lo:hi] - onset_abs + pre_samples) // bin_samples
+        bin_idx = bin_idx[(bin_idx >= 0) & (bin_idx < n_bins)]
+        counts[pop_idx] = np.bincount(bin_idx, minlength=n_bins)
+    return counts
+
+
 def get_population_responses(
     base_dir: str | Path = "/mnt/scratch/M150605_ICTP1",
     session: int = 1,
@@ -1455,55 +1611,10 @@ def get_population_responses(
     Types with no trials in the selected experiments are omitted from the dict.
     'flash' is always absent for sessions without a visual-flash experiment.
     """
-    base_dir = Path(base_dir)
-    if animal_id is None:
-        animal_id = base_dir.name
-    session_dir = base_dir / str(session)
-
-    # Per-mouse E/I boxes (full four-metric spec) unless the caller overrode a box.
-    if box_e is None or box_i is None:
-        default_e, default_i = _mouse_ei_boxes(animal_id)
-        box_e = default_e if box_e is None else box_e
-        box_i = default_i if box_i is None else box_i
-
-    kwik_path, kwx_path, manifest_path = _find_session_files(
-        session_dir, animal_id, session
-    )
-
-    # --- segment boundaries -------------------------------------------------
-    manifest = scipy.io.loadmat(str(manifest_path), squeeze_me=True)
-    lims: np.ndarray = manifest["lims"].astype(np.int64)
-    all_exps: np.ndarray = manifest["SELECTED_EXPERIMENTS"].astype(int)
-    exp_start_samples = np.concatenate([[0], np.cumsum(lims)])
-
-    if selected_exps is None:
-        selected_exps = _pulse_experiments(session_dir, list(all_exps), animal_id)
-        print(f"pulse experiments (from Protocol xfiles): {selected_exps}")
-
-    # --- load population spike trains (E and I) -----------------------------
-    print("Loading and classifying spikes …")
-    pop_times, pop_labels = _load_population_spikes(
-        kwik_path, kwx_path, min_cluster_group, box_e, box_i
-    )
-    e_times = pop_times[pop_labels == 0]   # wide / excitatory
-    i_times = pop_times[pop_labels == 1]   # narrow / inhibitory
-    print(f"  {(pop_labels==0).sum():,} E spikes,  {(pop_labels==1).sum():,} I spikes")
-
-    wl_to_pop = _wavelength_to_pop(animal_id)   # for per-condition E/I labels
-
-    # --- time axis and Hamming kernel ---------------------------------------
-    # Bin in integer samples: spike times are integer sample indices, so this is
-    # exact (no float-truncation at bin edges).
-    pre_samples = int(round(pre_s * SAMPLE_RATE_HZ))
-    post_samples = int(round(post_s * SAMPLE_RATE_HZ))
-    if pre_samples % bin_samples:
-        # Otherwise every post-stimulus bin straddles onset and is silently misaligned.
-        raise ValueError(f"pre_s = {pre_samples} samples is not a multiple of "
-                         f"bin_samples = {bin_samples}; onset would not be a bin edge")
+    sess = _load_session(base_dir, session, animal_id, selected_exps,
+                         min_cluster_group, box_e, box_i)
+    pre_samples, post_samples, n_bins, time_axis = _trial_bins(pre_s, post_s, bin_samples)
     bin_s = bin_samples / SAMPLE_RATE_HZ
-    n_bins = (pre_samples + post_samples) // bin_samples   # trailing partial bin dropped
-    bin_edges = (np.arange(n_bins + 1) * bin_samples - pre_samples) / SAMPLE_RATE_HZ
-    time_axis = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
     hamming_bins = max(1, int(round(hamming_ms / 1000.0 / bin_s)))
     if hamming_bins % 2 == 0:
@@ -1515,39 +1626,17 @@ def get_population_responses(
 
     # Accumulator: exp_type → { condition_key → [list of (2, n_bins) spike-count arrays] }
     accum: dict[str, dict[tuple, list]] = {}
+    wl_to_pop = sess["wl_to_pop"]
 
-    # --- iterate experiments -------------------------------------------------
-    for exp_i, exp_num in enumerate(all_exps):
-        if exp_num not in selected_exps:
-            continue
-
-        trials = _load_experiment_trials(session_dir, int(exp_num), animal_id)
-        if not trials:
-            print(f"  exp {exp_num}: no laser trials, skipping")
-            continue
-
-        exp_start = exp_start_samples[exp_i]
-        exp_end   = exp_start_samples[exp_i + 1]
-        print(f"  exp {exp_num}: {len(trials)} trials")
-
-        for trial in trials:
-            exp_type = trial["exp_type"]
-            onset_sample = exp_start + trial["onset_sample"]
-            win_start = max(onset_sample - pre_samples, exp_start)
-            win_end   = min(onset_sample + post_samples, exp_end)
-
-            counts = np.zeros((2, n_bins), dtype=np.float32)
-            for pop_idx, st in enumerate((e_times, i_times)):
-                lo = int(np.searchsorted(st, win_start))
-                hi = int(np.searchsorted(st, win_end))
-                if lo < hi:
-                    bin_idx = (st[lo:hi] - onset_sample + pre_samples) // bin_samples
-                    valid = (bin_idx >= 0) & (bin_idx < n_bins)
-                    np.add.at(counts[pop_idx], bin_idx[valid], 1.0)
-
-            # Condition key used to group trials: (pulse_type, ipi_ms, dur_ms)
-            ckey = (trial["pulse_type"], trial["ipi_ms"], trial["dur_ms"])
-            accum.setdefault(exp_type, {}).setdefault(ckey, []).append(counts)
+    # Windows clipped at an experiment boundary are kept here (missing bins read
+    # as zero), unlike `get_trial_counts`, which drops them.
+    for t in _iter_trials(sess, pre_samples, post_samples):
+        trial = t["trial"]
+        counts = _bin_trial(sess, t["onset_abs"], t["win_start"], t["win_end"],
+                            pre_samples, bin_samples, n_bins).astype(np.float32)
+        # Condition key used to group trials: (pulse_type, ipi_ms, dur_ms)
+        ckey = (trial["pulse_type"], trial["ipi_ms"], trial["dur_ms"])
+        accum.setdefault(trial["exp_type"], {}).setdefault(ckey, []).append(counts)
 
     # --- fold, average, smooth, normalise -----------------------------------
     # One seeded RNG stream, consumed in a deterministic condition order, makes
@@ -1617,3 +1706,252 @@ def get_population_responses(
         )
 
     return output
+
+
+def get_trial_counts(
+    base_dir: str | Path = "/mnt/scratch/M150605_ICTP1",
+    session: int = 1,
+    selected_exps: list[int] | None = None,
+    pre_s: float = 0.5,
+    post_s: float = 1.5,
+    bin_samples: int = 300,
+    min_cluster_group: int = 2,
+    animal_id: str | None = None,
+    box_e: dict | None = None,
+    box_i: dict | None = None,
+) -> dict[str, np.ndarray]:
+    """
+    Single-trial E/I population spike counts for one session, as a flat trial table.
+
+    No averaging, smoothing, baseline normalisation or fold splitting: those are
+    downstream choices.  In particular the paper normalises the *trial-averaged*
+    PSTH by its baseline; normalising single trials instead would divide by
+    near-zero baselines, and a mean of ratios is not a ratio of means.
+
+    The "table" is parallel arrays sharing axis 0 — a trial table (axis 0 =
+    trial, in recording order) and a condition table (axis 0 = condition) linked
+    by `cond_idx`.  Keys are exactly the saved npz keys, so
+    `np.savez(path, **out)` / `dict(np.load(path))` round-trip it.
+
+    Every trial shares one fixed window [-pre_s, +post_s).  A trial whose window
+    runs past its experiment's span in the concatenated recording is DROPPED
+    (count in `n_trials_dropped`): the spikes there belong to the neighbouring
+    experiment, so zero-filling would fake silence.  Windows may still contain
+    the next trial's pulse if the inter-trial interval is shorter than post_s.
+
+    Parameters as in `get_population_responses`; `bin_samples` defaults to 300
+    (10 ms) and `pre_s` must span a whole number of bins.
+
+    Returns
+    -------
+    dict of ndarrays (empty dict if the session has no laser trials):
+
+    Trial table, axis 0 = n_trials
+        counts        uint16 (n_trials, 2, n_bins)  spike counts; axis 1: 0 = E, 1 = I
+        cond_idx      int64  row of the condition table
+        exp_num       int64  experiment number
+        trial_in_exp  int64  index among that experiment's matched laser trials
+        onset_sample  int64  onset, experiment-local 30 kHz sample
+
+    Condition table, axis 0 = n_cond, sorted by (exp type, ipi_ms, durations)
+        cond_exp_type    str    'single_E', 'paired_EI', … (see ALL_EXP_TYPES)
+        cond_pulse_type  int64  Protocol pulseType code
+        cond_ipi_ms      int64  inter-pulse interval (0 for single)
+        cond_dur1_ms     float  first-pulse duration
+        cond_dur2_ms     float  second-pulse duration (NaN for single)
+        cond_first_pop   str    'E'/'I' driven by pulse 1
+        cond_second_pop  str    'E'/'I' driven by pulse 2 ('' for single)
+
+    Scalars (0-d) and axes
+        time_axis         float64 (n_bins,) bin centres, s relative to onset
+        bin_samples, sampling_freq_hz, pre_s, post_s
+        animal_id, session, ei_cache_key, n_trials_dropped
+    """
+    sess = _load_session(base_dir, session, animal_id, selected_exps,
+                         min_cluster_group, box_e, box_i)
+    pre_samples, post_samples, n_bins, time_axis = _trial_bins(pre_s, post_s, bin_samples)
+    wl_to_pop = sess["wl_to_pop"]
+
+    rows: list[dict] = []
+    n_dropped = 0
+    for t in _iter_trials(sess, pre_samples, post_samples):
+        if not t["complete"]:
+            n_dropped += 1
+            continue
+        tr = t["trial"]
+        rows.append(dict(
+            counts=_bin_trial(sess, t["onset_abs"], t["win_start"], t["win_end"],
+                              pre_samples, bin_samples, n_bins),
+            ckey=(tr["exp_type"], tr["pulse_type"], tr["ipi_ms"], tr["dur_ms"]),
+            exp_num=t["exp_num"], trial_in_exp=t["trial_in_exp"],
+            onset_sample=tr["onset_sample"],
+        ))
+    if n_dropped:
+        print(f"  dropped {n_dropped} trials whose [-{pre_s}, +{post_s}) s window "
+              f"crosses an experiment boundary")
+    if not rows:
+        return {}
+
+    # dur_ms is a scalar, or a (d1, d2) tuple when paired durations differ;
+    # normalise to a tuple so mixed keys sort.
+    def _durs(dur) -> tuple:
+        return tuple(dur) if isinstance(dur, tuple) else (dur,)
+
+    cond_keys = sorted({r["ckey"] for r in rows},
+                       key=lambda k: (ALL_EXP_TYPES.index(k[0]), k[2], _durs(k[3])))
+    cond_lookup = {k: i for i, k in enumerate(cond_keys)}
+
+    counts = np.stack([r["counts"] for r in rows])
+    if counts.max() > np.iinfo(np.uint16).max:
+        raise ValueError(f"bin count {counts.max()} overflows uint16; "
+                         f"bin_samples = {bin_samples} is too wide")
+
+    dur1, dur2, first, second = [], [], [], []
+    for exp_type, pt, ipi, dur in cond_keys:
+        d = _durs(dur)
+        pops = _pulse_populations(pt, wl_to_pop)
+        dur1.append(d[0])
+        first.append(pops[0])
+        # Single pulse (ipi 0): only one pulse is delivered, so no second pulse.
+        dur2.append(np.nan if ipi == 0 else d[-1])
+        second.append("" if ipi == 0 else pops[1])
+
+    return dict(
+        counts=counts.astype(np.uint16),
+        cond_idx=np.array([cond_lookup[r["ckey"]] for r in rows], dtype=np.int64),
+        exp_num=np.array([r["exp_num"] for r in rows], dtype=np.int64),
+        trial_in_exp=np.array([r["trial_in_exp"] for r in rows], dtype=np.int64),
+        onset_sample=np.array([r["onset_sample"] for r in rows], dtype=np.int64),
+        cond_exp_type=np.array([k[0] for k in cond_keys]),
+        cond_pulse_type=np.array([k[1] for k in cond_keys], dtype=np.int64),
+        cond_ipi_ms=np.array([k[2] for k in cond_keys], dtype=np.int64),
+        cond_dur1_ms=np.array(dur1, dtype=np.float64),
+        cond_dur2_ms=np.array(dur2, dtype=np.float64),
+        cond_first_pop=np.array(first),
+        cond_second_pop=np.array(second),
+        time_axis=time_axis,
+        bin_samples=np.array(bin_samples),
+        sampling_freq_hz=np.array(SAMPLE_RATE_HZ),
+        pre_s=np.array(pre_s),
+        post_s=np.array(post_s),
+        animal_id=np.array(sess["animal_id"]),
+        session=np.array(sess["session"]),
+        ei_cache_key=np.array(sess["ei_cache_key"]),
+        n_trials_dropped=np.array(n_dropped),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Choosing the trial window (used by tutorial.ipynb)
+# ---------------------------------------------------------------------------
+
+def get_trial_margins(
+    base_dir: str | Path = "/mnt/scratch/M150605_ICTP1",
+    session: int = 1,
+    selected_exps: list[int] | None = None,
+    animal_id: str | None = None,
+) -> dict[str, np.ndarray]:
+    """
+    Per laser trial, how much recording is available around its onset — to pick
+    `(pre_s, post_s)` for `get_trial_counts` before paying for spike loading.
+
+    Covers every matched laser trial, before any window is applied.  Reads only
+    the manifest, Protocol/Timeline and `.ns5` laser channels (no spikes).
+
+    Returns dict of (n_trials,) arrays, in recording order:
+        exp_num, trial_in_exp, onset_sample   as in `get_trial_counts`
+        exp_type, ipi_ms                      condition labels
+        last_pulse_end_s   onset → end of the trial's last pulse (Protocol timing:
+                       ipi + second duration if paired, else the single duration)
+        pre_avail_s    experiment start → onset (window start can't precede it)
+        post_avail_s   onset → experiment end
+        prev_gap_s     previous trial's onset → this onset (inf for an experiment's first)
+        next_gap_s     this onset → next trial's onset (inf for an experiment's last)
+    """
+    sess = _session_layout(base_dir, session, animal_id, selected_exps)
+    cols: dict[str, list] = {k: [] for k in (
+        "exp_num", "trial_in_exp", "onset_sample", "exp_type", "ipi_ms",
+        "last_pulse_end_s", "pre_avail_s", "post_avail_s", "prev_gap_s", "next_gap_s")}
+    for t in _iter_trials(sess, 0, 0):
+        cols["exp_num"].append(t["exp_num"])
+        cols["trial_in_exp"].append(t["trial_in_exp"])
+        cols["onset_sample"].append(t["trial"]["onset_sample"])
+        cols["exp_type"].append(t["trial"]["exp_type"])
+        cols["ipi_ms"].append(t["trial"]["ipi_ms"])
+        dur = t["trial"]["dur_ms"]
+        last_dur = dur[-1] if isinstance(dur, tuple) else dur
+        cols["last_pulse_end_s"].append((t["trial"]["ipi_ms"] + last_dur) / 1000.0)
+    out = {k: np.array(v) for k, v in cols.items() if v}
+    if not out:
+        return {}
+
+    exp_len = {e: end - start for e, start, end in sess["exps"]}
+    onset = out["onset_sample"]
+    out["pre_avail_s"] = onset / SAMPLE_RATE_HZ
+    out["post_avail_s"] = (np.array([exp_len[e] for e in out["exp_num"]]) - onset) / SAMPLE_RATE_HZ
+    # Gaps only within an experiment: across a boundary the "neighbour" is in a
+    # different recording.
+    gap = np.diff(onset) / SAMPLE_RATE_HZ
+    same_exp = np.diff(out["exp_num"]) == 0
+    gap = np.where(same_exp, gap, np.inf)
+    out["prev_gap_s"] = np.concatenate([[np.inf], gap])
+    out["next_gap_s"] = np.concatenate([gap, [np.inf]])
+    return out
+
+
+def window_trial_loss(margins: dict[str, np.ndarray], pre_s: float,
+                      post_s: float) -> dict[str, int]:
+    """
+    What a `[-pre_s, +post_s)` window would cost, given `get_trial_margins` output:
+        n_trials                 all laser trials
+        n_dropped                window crosses an experiment boundary — these
+                                 are what `get_trial_counts` drops
+        n_next_trial_in_window   kept, but the next trial starts before +post_s
+        n_prev_trial_in_window   kept, but the previous trial started after -pre_s
+    The last two are kept by `get_trial_counts`; they are the user's call.
+    """
+    dropped = (margins["pre_avail_s"] < pre_s) | (margins["post_avail_s"] < post_s)
+    kept = ~dropped
+    return dict(
+        n_trials=int(dropped.size),
+        n_dropped=int(dropped.sum()),
+        n_next_trial_in_window=int((kept & (margins["next_gap_s"] < post_s)).sum()),
+        n_prev_trial_in_window=int((kept & (margins["prev_gap_s"] < pre_s)).sum()),
+    )
+
+
+def trial_spacing_summary(
+    margins: dict[str, np.ndarray],
+    pre_s: float = 1.0,
+    post_last_s: float = 0.2,
+) -> dict[str, dict[str, float]]:
+    """
+    Per experiment type (plus 'all'), from `get_trial_margins` output:
+
+        required_len_s   longest window any trial needs to span pre_s before its
+                         first pulse to post_last_s after the end of its last pulse
+                         (= pre_s + max(last_pulse_end_s) + post_last_s)
+        min_gap_s        shortest onset-to-onset interval to the next trial
+                         (within an experiment)
+        median_gap_s
+        n_trials
+
+    A window [-pre_s, +post_s) keeps the next trial's pre-pulse period out of this
+    trial's window when pre_s + post_s <= min_gap_s.  The gap is attributed to the
+    *earlier* trial's type, which is what limits that trial's post_s.  Experiments
+    usually interleave types, so a type's gaps also depend on its neighbours.
+    """
+    out: dict[str, dict[str, float]] = {}
+    types = ["all"] + [t for t in ALL_EXP_TYPES if t in set(margins["exp_type"])]
+    for t in types:
+        m = np.ones(margins["exp_type"].size, bool) if t == "all" else margins["exp_type"] == t
+        gaps = margins["next_gap_s"][m]
+        gaps = gaps[np.isfinite(gaps)]
+        out[t] = dict(
+            required_len_s=float(pre_s + margins["last_pulse_end_s"][m].max() + post_last_s),
+            min_gap_s=float(gaps.min()) if gaps.size else np.inf,
+            median_gap_s=float(np.median(gaps)) if gaps.size else np.inf,
+            n_trials=int(m.sum()),
+        )
+    return out
+

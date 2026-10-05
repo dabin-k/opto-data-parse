@@ -1,101 +1,106 @@
-# Structure of population_rates npz files
+# Structure of trial_counts npz files
 
-Saved E/I mean population firing rates , grouped by experiment type and stimulus condition.
-Produced by `regenerate_population_rates.py` from `data_loader.get_population_responses`.
-Live in `results/`.
+Single-trial E/I population spike counts, one file per (mouse, session).
+Produced by `regenerate_population_rates.py` from `data_loader.get_trial_counts`.
+Live in `results/`. Worked examples: `tutorial.ipynb`.
+
+Nothing is averaged, smoothed, baseline-normalised or split into CV folds — those
+are downstream choices. (The older `*population_rates_*.npz` files hold per-fold
+trial averages; their format is described in git history of this file.)
 
 ## Naming convention
-- `population_rates_<animal_id>_s<session>.npz`
+- `trial_counts_b<N>_<animal_id>_s<session>.npz`, e.g. `trial_counts_b300_M150605_ICTP1_s1.npz`.
 - `<animal_id>` = mouse + protocol, e.g. `M150605_ICTP1`, `M150609_ICTP2`, `M151020_ICTP1`.
+- `b<N>` = bin width in 30 kHz sampling intervals (`b300` = 10 ms).
 - Session is always `s1` so far.
-- `b<N>_population_rates_<animal_id>_s1.npz` = binned at `N` sampling intervals
-  (see "Bin width" below), e.g. `b300_` = 10 ms bins. Files without a `b<N>_` tag
-  predate this and are 1 ms bins (`N = 30`).
-- Default files are **unsmoothed** (trial-averaged raw rates). The `smoothed_*`
-  prefixed files are the paper's 40 ms Hamming-smoothed version, kept for reference.
-  A symmetric Hamming window smears the evoked transient ~half its width *before*
-  the pulse, so the raw rates are the truthful onset timing.
 
-## Available fields
-Per experiment type present in the session, three keys:
-- `{type}__responses` — float64 array, the mean population firing rates (see shapes below).
-- `{type}__time_axis` — float64 (n_bins,), bin centres.
-- `{type}__conditions` — 0-d string array holding `json.dumps(list-of-dicts)`; `json.loads` it.
+## Design: a flat trial table
+Conditions have very different repeat counts (10 – 308 trials per condition, and
+M151020 has a median of 10 but a max of 184), so a `(n_cond, n_repeats, 2, n_bins)`
+cube would be mostly NaN padding. Instead the file is two *tables* — sets of
+parallel arrays sharing axis 0 — linked by an index:
 
-Types: `single_E`, `single_I`, `paired_EE`, `paired_II`, `paired_EI`, `paired_IE`.
-- `single_*` = single pulse (ipi = 0); `paired_XY` = two pulses driving pop X then pop Y.
-- E = excitatory (wide-spike / pyramidal), I = inhibitory (narrow-spike / PV).
-- Types with no trials in the session are omitted. `flash` (visual) is never saved.
+- **Trial table** (axis 0 = trial, in recording order): `counts` and per-trial labels.
+- **Condition table** (axis 0 = condition): `cond_*` arrays.
+- `cond_idx[i]` = the condition row of trial `i` (like a database foreign key).
 
-Plus provenance scalars (0-d arrays):
-- `ei_cache_key` — str, the classified-cache key (session + boxes + classification version) that produced the E/I labels.
-- `n_folds` — int, number of CV folds (3).
-- `fold_seed` — int, RNG seed fixing the trial→fold split (0).
-- `bin_samples` — int, bin width in sampling intervals (absent from untagged 1 ms files).
+All experiment types live in one table; the type is a column (`cond_exp_type`), not a
+key prefix. Every file has the same keys, whatever the mouse.
 
-## Shape of responses
-`{type}__responses` shape `(n_conditions, n_folds, 2, n_bins)`:
-- axis 0: condition — aligned to the `{type}__conditions` list.
-- axis 1: fold — one mean population firing rate per CV fold (not a single all-trials mean). But each fold is itself a mean of a subset of trials to reduce noise.
-- axis 2: population — `0 = E` (wide), `1 = I` (narrow).
-- axis 3: time bin — aligned to `time_axis`.
+`data_loader.get_trial_counts` returns a plain `dict[str, np.ndarray]` whose keys are
+exactly the npz keys, so `np.savez(path, **out)` and `dict(np.load(path))` round-trip.
+Strings are stored as NumPy unicode arrays, so `allow_pickle` is not needed.
 
-Values are per-fold trial-averaged firing rates, baseline-normalised (divided by
-mean rate in −0.5 to −0.1 s, so baseline ≈ 1.0). Default files are unsmoothed;
-`smoothed_*` files additionally apply a 40 ms Hamming window before normalising.
-A fold with no trials (condition with fewer trials than `n_folds`) is all-NaN.
+Counts are stored rather than rates because the paper baseline-normalises the
+*trial-averaged* PSTH: normalising single trials would divide by near-zero
+baselines, and a mean of ratios is not a ratio of means.
 
-`time_axis`: seconds relative to pulse onset. Default window −0.5 to +1.5 s.
-Pulse onset (0 s) is always a bin edge. For example, 1 ms bins (`bin_samples = 30`)
-→ 2000 bins, centres −0.4995 … +1.4995; 10 ms bins (`bin_samples = 300`) → 200
-bins, centres −0.495 … +1.495.
+## Fields
+
+### Trial table — axis 0 = `n_trials`
+| key | dtype, shape | meaning |
+|---|---|---|
+| `counts` | uint16 `(n_trials, 2, n_bins)` | spike counts per bin; axis 1: `0 = E` (wide), `1 = I` (narrow) |
+| `cond_idx` | int64 `(n_trials,)` | row of the condition table |
+| `exp_num` | int64 `(n_trials,)` | experiment number within the session |
+| `trial_in_exp` | int64 `(n_trials,)` | index among that experiment's matched laser trials |
+| `onset_sample` | int64 `(n_trials,)` | first-pulse onset, experiment-local 30 kHz sample |
+
+### Condition table — axis 0 = `n_cond`
+| key | dtype | meaning |
+|---|---|---|
+| `cond_exp_type` | str | `single_E`, `single_I`, `paired_EE`, `paired_II`, `paired_EI`, `paired_IE` |
+| `cond_pulse_type` | int64 | Protocol `pulseType` code (1 = BB, 2 = GG, 3 = BG, 4 = GB) |
+| `cond_ipi_ms` | int64 | inter-pulse interval; 0 for single |
+| `cond_dur1_ms` | float64 | first-pulse duration |
+| `cond_dur2_ms` | float64 | second-pulse duration; NaN for single |
+| `cond_first_pop` | str | `"E"`/`"I"` driven by pulse 1 |
+| `cond_second_pop` | str | `"E"`/`"I"` driven by pulse 2; `""` for single |
+
+Sorted by (experiment type in the order above, `ipi_ms`, durations). Only conditions
+with at least one kept trial appear. The exact condition set is per-mouse — read it
+off the table rather than assuming.
+
+### Scalars (0-d) and axes
+| key | meaning |
+|---|---|
+| `time_axis` | float64 `(n_bins,)`, bin centres in s relative to onset |
+| `bin_samples` | bin width in 30 kHz sampling intervals |
+| `sampling_freq_hz` | 30 000 |
+| `pre_s`, `post_s` | trial window `[-pre_s, +post_s)` |
+| `animal_id`, `session` | which session |
+| `ei_cache_key` | classified-spike cache key (session + E/I boxes + classification version) that produced the E/I labels |
+| `n_trials_dropped` | trials excluded because their window crossed an experiment boundary |
+
+## Trial window and dropped trials
+Every trial uses one fixed window `[-pre_s, +post_s)` (set in
+`regenerate_population_rates.py`; default −0.5 to +1.5 s). Onset (0 s) is always a
+bin edge; a trailing partial bin is dropped. A trial whose window runs past its
+experiment's span in the concatenated recording is **dropped**, not zero-filled: the
+spikes there belong to the neighbouring experiment. A window *can* contain the next
+trial's pulse if the inter-trial interval is shorter than `post_s`.
 
 ## Bin width
-Spikes are timestamped on the **30 kHz** recording clock (`data_loader.SAMPLE_RATE_HZ`),
-as integer sample indices. Bin width is therefore chosen as `bin_samples`, an integer
-number of 1/30 ms sampling intervals (`BIN_SAMPLES` in `regenerate_population_rates.py`),
-and spikes are binned exactly in integer arithmetic. The user converts a desired
-duration to samples (duration_s × 30 000). `bin_samples` must divide the 0.5 s
-pre-onset window (15 000 samples), or `get_population_responses` raises; a trailing
-partial bin at the end of the window is dropped. Each value is the trial-averaged
-mean rate within the bin (spike count / bin duration), then baseline-normalised.
-Paired IPIs shorter than the bin width (e.g. 5, 8 ms at 10 ms bins) land both pulses
-in one bin.
-
-## k-fold splitting logic
-- Per condition, trials are permuted with `np.random.default_rng(fold_seed)` then split by `np.array_split(perm, n_folds)`.
-- As-even-as-possible; earlier folds absorb the remainder. Empty fold → NaN population firing rate, count 0.
-- Split is deterministic from `fold_seed` alone (one RNG stream consumed in sorted-condition order).
-- Recover the all-trials mean = average of fold mean population firing rates weighted by `n_trials_per_fold`.
-
-## Shape of conditions
-`json.loads(str(d['{type}__conditions']))` → list of dicts, length `n_conditions`,
-aligned to axis 0 of `responses`. Each dict:
-- `pulse_type` — int, protocol pulse-type code.
-- `ipi_ms` — int, inter-pulse interval (0 for `single_*`).
-- `dur_ms` — pulse duration; scalar, or `[d1, d2]` when the two pulses differ.
-- `first_pop`, `second_pop` — "E"/"I", populations driven by pulse 1 and pulse 2.
-- `n_trials` — int, total trials across folds.
-- `n_trials_per_fold` — list of ints (length `n_folds`), aligned to axis 1.
-
-Conditions are sorted by `(ipi_ms, dur_ms)`.
-
-## Available stimulus conditions
-- `single_E` / `single_I`: differ by `dur_ms` (e.g. 1 ms, 2 ms).
-- `paired_*`: differ by `ipi_ms` (e.g. 5, 8, … ms) and `dur_ms`.
-- Exact set is per-mouse — read them off the `conditions` list rather than assuming.
+Spikes are timestamped on the **30 kHz** recording clock as integer sample indices,
+so bin width is an integer number of 1/30 ms sampling intervals (`bin_samples`) and
+binning is exact. `bin_samples` must divide `pre_s × 30 000`, or the loader raises.
+Paired IPIs shorter than the bin width (e.g. 5, 8 ms at 10 ms bins) put both pulses in
+one bin.
 
 ## How to pull in data
 ```python
-import json, numpy as np
+import numpy as np
 
-d = np.load("results/population_rates_M150605_ICTP1_s1.npz", allow_pickle=True)
+d = dict(np.load("results/trial_counts_b300_M150605_ICTP1_s1.npz"))
 
-resp = d["paired_EE__responses"]        # (n_cond, n_folds, 2, n_bins)
-t    = d["paired_EE__time_axis"]         # (n_bins,)
-cond = json.loads(str(d["paired_EE__conditions"]))   # list of dicts
+# all paired_EE trials
+cond_rows = np.flatnonzero(d["cond_exp_type"] == "paired_EE")
+x = d["counts"][np.isin(d["cond_idx"], cond_rows)]        # (n, 2, n_bins)
 
-# All-trials mean E population firing rates for condition 0 (weight folds by trial count):
-w = np.array(cond[0]["n_trials_per_fold"], float)
-e_r = np.nansum(resp[0, :, 0, :] * w[:, None], axis=0) / w.sum()
+# trial-averaged, baseline-normalised E/I rate for one condition (the paper's PSTH)
+k = cond_rows[0]
+bin_s = d["bin_samples"] / d["sampling_freq_hz"]
+rate = d["counts"][d["cond_idx"] == k].mean(axis=0) / bin_s          # (2, n_bins) Hz
+bl = (d["time_axis"] >= -0.5) & (d["time_axis"] < -0.1)
+psth = rate / rate[:, bl].mean(axis=1, keepdims=True)
 ```

@@ -70,8 +70,10 @@ Per-experiment dirs `…/1/<exp>/`:
 ## Code
 
 - `data_loader.py` — public API:
+  - `get_trial_counts(...)` → **single-trial** E/I population spike counts for one session as a flat trial table: `counts (n_trials, 2, n_bins)` + per-trial and per-condition arrays linked by `cond_idx`. No averaging, smoothing, normalisation or folds — those are downstream. Saved by `regenerate_population_rates.py`; layout in `DATA.md`, worked examples in `tutorial.ipynb`.
+  - `get_trial_margins(...)`, `window_trial_loss(...)` → help choose the trial window (time available around each onset; trials a window would drop).
   - `load_data(...)` → `(trials, units, bins)` spike counts + stimulus + trial/unit info.
-  - `get_population_responses(...)` → **per-fold** trial-averaged, Hamming-smoothed, baseline-normalised E/I PSTHs per condition. Each condition's trials are randomly split into `n_folds` folds (default 3, seed `fold_seed`); `responses` is `(n_cond, n_folds, 2, n_bins)` and each condition records `n_trials_per_fold`. Train/test PSTHs are built downstream by averaging held-in folds vs. the held-out one (paper S1.10 k-fold CV).
+  - `get_population_responses(...)` → *legacy* per-fold trial-averaged E/I PSTHs `(n_cond, n_folds, 2, n_bins)`; still read by `figures.plot_population_rates` / `plot_population_rates.py` and the old `*population_rates_*.npz` files.
 - `laser_timing.py` — parse `.ns5` (NEURALSG), auto-detect laser channels, return per-trial onsets.
 - `figures.py` — `plot_raw_traces_around_pulse()` reproduces Fig S1.B.
 - Run against miniconda **base** python. Needs the dataset mounted.
@@ -97,7 +99,7 @@ through it, so nothing else changes.
 
 Checked on 2 mice so far: **M150605A** and **M150609A** (both `M15060x_ICTP1`). Not yet verified on the rest.
 
-**Never parse `M150909C`, `M150823B`, `M150303B`.** The population-rates pipeline hard-codes 3-fold cross-validation (paper S1.10), but these three sessions used a different number of folds (paper p22). Rather than making `n_folds` per-mouse, we simply exclude them — the remaining sessions give enough data.
+**Never parse `M150909C`, `M150823B`, `M150303B`.** The legacy population-rates pipeline hard-coded 3-fold cross-validation (paper S1.10), but these three sessions used a different number of folds (paper p22), so they were excluded. *Open:* the single-trial files no longer bake in folds, so this reason no longer applies — revisit whether to include them.
 
 Same across both (promising, unverified elsewhere):
 - `.ns5` = 36 ch = 32 neural + 4 analog (ids 129–132), **NEURALSG** format.
