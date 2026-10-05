@@ -61,11 +61,61 @@ Per-experiment dirs `…/1/<exp>/`:
 ## Experiment layout (session 1)
 
 - `1, 14` — visual tuning (no laser, skipped by the loader)
-- `2, 3, 6, 7` — paired-pulse opto (`stim2PulsesRandNoise`)
-- `4, 5, 13` — single-pulse opto (`stim2Pulses2Waves`)
+- `2, 3, 6, 7` — mixed single + paired-pulse opto (`stim2PulsesRandNoise`, 96 conditions:
+  paired *and* `intT == 0` single pulses, some during a screen stimulus — see "RandNoise" below)
+- `4, 5, 13` — single-pulse opto only (`stim2Pulses2Waves`)
 - `8, 10–12` — regular periodic pulses (different paradigm)
 - `DEFAULT_PULSE_EXPS = [2,3,4,5,6,7,13]` — the E/I analysis subset.
 - Pulse-type map: `1=BB(EE)`, `2=GG(II)`, `3=BG(EI)`, `4=GB(IE)`; `intT==0` ⇒ single.
+- Experiment numbers are the mpep run order within series 1: dir `1/<exp>/`, files
+  `<animal>_1_<exp>.*`. The manifest's `ns5files2unify` / `SELECTED_EXPERIMENTS` give the
+  order they were concatenated into the `.kwik` (with start times).
+
+## Protocol parameters (what `Protocol.mat` `pars` mean)
+
+| param | meaning | confidence |
+|---|---|---|
+| `pulseType` | 1 = BB, 2 = GG, 3 = BG, 4 = GB (laser order) | verified against TTL channels |
+| `durT` / `durT1`, `durT2` | pulse duration(s), stored as ms × 10 | verified: TTL widths match (1–10 ms) |
+| `intT` | **gap from the END of pulse 1 to the START of pulse 2**, ms; 0 = single pulse | verified, see below |
+| `Vamp` | laser drive; 0 = no laser (blank trial, no TTL) | verified: no TTL for `Vamp = 0` |
+| `Tp` | laser onset relative to the trial's Timeline `StimStart`, ms | verified: onset − (StimStart + Tp) is constant to ±65 ms (M150605 exp 2); matching on it labels 2103/2104 M150605 trials with 0 pulse-check failures |
+| `c` | screen-stimulus contrast (0 or 100) | conjecture, see RandNoise |
+| `x1 x2 y1 y2 sqsz nfr ncs seedw` | screen-stimulus geometry / squares / frames / seed | conjecture, see RandNoise |
+
+**`intT` is not onset-to-onset.** Measured on the laser TTLs, onset-to-onset = `intT` + `dur1`
+(plus ~0.05 % stimulus-PC vs Blackrock clock drift). Decisive case, M151020 exp 8: `intT` = 35 ms
+gives 37.0 ms apart with a 2 ms first pulse and 45.0 ms with a 10 ms one; at `intT` = 70 the
+excess equals `dur1` for all of 1, 2, 3, 4, 8, 10 ms (±0.07 ms). The paper's IPIs (Table S3) are
+these `intT` numbers; for its 1–2 ms pulses the two definitions differ by 1–2 ms.
+
+### RandNoise — laser pulses during a screen stimulus (finding, 2026-10-05)
+
+The `stim2Pulses*RandNoise` protocols interleave, within one experiment:
+- `c = 0` conditions — laser only (screen presumably blank), `Tp = 500`.
+- `c = 100` conditions — laser fired `Tp` (400/500/900/1300) ms into a screen stimulus.
+- `Vamp = 0` conditions — the screen stimulus with no laser.
+
+**What the screen stimulus is, is a CONJECTURE.** The parameters (screen region `x1..y2`, square
+size `sqsz`, frame count `nfr`, random seed `seedw`, contrast `c`) and the protocol name suggest a
+random-checkerboard ("noise") movie. Nothing in the data or the paper documents it. The paper
+(S1.5) says optogenetic stimulation was delivered "while the mouse was facing a blank gray
+screen"; its only visual stimuli are LED flashes in *wild-type* mice, in separate sessions. So the
+`c = 100` trials were most likely **not** part of the paper's analysis.
+
+Share of laser trials with `c > 0`: 42 % in M150605_ICTP1 / M150609_ICTP1 / M150609_ICTP2,
+20 % in M150823_ICTP2, 6 % in M151020_ICTP1. The loader keys conditions on `c`, `Tp` and
+`seedw` as well, so they are never pooled with laser-only trials (filter on `cond_contrast`).
+Supporting evidence that they differ: in M150605 paired_EE, `c = 100` conditions show extra
+sharp E/I peaks at ~0.17 s and ~0.35 s after the laser that laser-only conditions lack.
+
+### IPI-1000 trials were aligned to the second pulse (fixed 2026-10-05)
+Pulses used to be split into trials at any gap > 1.0 s. A 1000 ms pair is 1001.5 ms
+onset-to-onset, so it was cut in two, and the Timeline label landed on the *second* pulse.
+The loader now groups by the protocol's own longest within-trial interval, raises on
+ambiguous gaps, matches on `StimStart + Tp`, and checks every trial's pulses against its label
+(`data_loader._experiment_trials`). Older outputs (`*population_rates_*.npz`, plots) predate
+this and also pool `c = 100` trials.
 
 ## Code
 
@@ -73,7 +123,9 @@ Per-experiment dirs `…/1/<exp>/`:
   - `get_trial_counts(...)` → **single-trial** E/I population spike counts for one session as a flat trial table: `counts (n_trials, 2, n_bins)` + per-trial and per-condition arrays linked by `cond_idx`. No averaging, smoothing, normalisation or folds — those are downstream. Saved by `regenerate_population_rates.py`; layout in `DATA.md`, worked examples in `tutorial.ipynb`.
   - `get_trial_margins(...)`, `window_trial_loss(...)` → help choose the trial window (time available around each onset; trials a window would drop).
   - `load_data(...)` → `(trials, units, bins)` spike counts + stimulus + trial/unit info.
-  - `get_population_responses(...)` → *legacy* per-fold trial-averaged E/I PSTHs `(n_cond, n_folds, 2, n_bins)`; still read by `figures.plot_population_rates` / `plot_population_rates.py` and the old `*population_rates_*.npz` files.
+  - `get_population_responses(...)` → *legacy* per-fold trial-averaged E/I PSTHs `(n_cond, n_folds, 2, n_bins)`; still read by `figures.plot_population_rates` and the old `*population_rates_*.npz` files.
+- `trial_analysis.py` — downstream helpers for the trial files: `load`, `select`, `rebin` (exact count sums), `psth` (trial-average → optional Hamming → baseline-normalise), `fold_labels` (seeded k-fold; defaults reproduce the legacy folds).
+- `plot_population_rates.py` — QC figures per mouse from the trial files (folds thin, all-trials bold), written to `results/population_rates_plots/<mouse>_TRIALS/`.
 - `laser_timing.py` — parse `.ns5` (NEURALSG), auto-detect laser channels, return per-trial onsets.
 - `figures.py` — `plot_raw_traces_around_pulse()` reproduces Fig S1.B.
 - Run against miniconda **base** python. Needs the dataset mounted.
@@ -123,7 +175,7 @@ Differs per mouse (must be handled, not hardcoded):
 ## Known issues / uncertainties
 
 - **E/I waveform threshold** (0.4 ms) is unvalidated — current split is lopsided (~113k wide vs ~1.09M narrow). Needs the per-session bimodal-width check.
-- **~20 % of single_E trials in exp 5 fired no analog TTL** (all 1 ms pulses); cause unknown. Loader matches by relative timing, so these trials are just dropped.
+- ~~20 % of single_E trials in exp 5 fired no analog TTL~~ — resolved: those are Protocol `Vamp = 0` blank (no-laser) trials.
 - **Clusterless denoising** (paper's LSH over PCA features) is not reimplemented; we use raw per-spike waveform width.
 - **Probe depth ordering** not applied — `figures.py` shows sites in acquisition order, not shank depth.
 - First ~20 ms after a strong E pulse: detection underestimates activity (overlapping spikes / field). Treat with suspicion — paper caveat.

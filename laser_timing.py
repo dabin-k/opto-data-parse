@@ -25,12 +25,11 @@ pulse duration (0.5-4 ms). Detecting high-threshold rising edges on ain 131/132
 gives onsets that produce sharp, short-latency (2-12 ms) evoked responses when
 spikes are aligned to them — i.e. correct alignment.
 
-Verified on exp 5 (single-pulse): ain131 -> 20 single_E, ain132 -> 20 single_I,
-matched to Timeline trials with <=52 ms residual (the residual is exactly the
-uncorrected Timeline/Blackrock clock drift). Note 10 of the 30 single_E trials
-(all 1 ms) produced no analog TTL on either line — a real, still-unexplained
-per-trial gap, so onset counts can be < Timeline trial counts; match by relative
-timing rather than assuming a 1:1 count.
+Verified on exp 5 (single-pulse): ain131 -> 20 single_E, ain132 -> 20 single_I.
+The 10 Timeline trials with no TTL there are Protocol `Vamp = 0` blank trials
+(no laser), not missing pulses.  Grouping pulses into trials, matching them to
+Timeline/Protocol labels and checking them per trial lives in
+`data_loader._experiment_trials`.
 
 The `.nev` is NOT usable for this: it contains only online threshold-crossing
 spike events (packet ids 1-32, all NEUEVWAV), with no digital-input packets.
@@ -149,28 +148,41 @@ def laser_onsets(
     return out
 
 
-def experiment_trial_onsets(
-    ns5_path: str | Path,
-    iti_gap_s: float = 1.0,
-    **detect_kwargs,
-) -> np.ndarray:
-    """
-    First-pulse onset (experiment-local samples) of each delivered trial.
+#: Laser wavelength (nm) carried by each TTL analog input.  Which *population* a
+#: wavelength drives is mouse-line dependent (mouse_lines.py); the channel ->
+#: wavelength wiring is a rig fact.  Verified on M150605 / M150609 earlier, and on
+#: every loaded trial since by `data_loader`'s per-trial pulse check (a wrong
+#: entry here makes that check fail loudly).
+CHANNEL_WAVELENGTH_NM: dict[int, int] = {131: 445, 132: 561}
 
-    Pools rising edges across all detected laser channels and splits the train
-    at gaps larger than `iti_gap_s`: within-trial pulses (paired-pulse interval
-    <= 800 ms) stay together, while the >1.6 s inter-trial interval starts a new
-    trial. The first edge of each group is that trial's onset.
+
+def laser_pulses(
+    ns5_path: str | Path,
+    threshold: float = 2000.0,
+) -> dict[str, np.ndarray]:
     """
-    chans = laser_onsets(ns5_path, **detect_kwargs)
-    if not chans:
-        return np.empty(0, dtype=np.int64)
-    allon = np.sort(np.concatenate(list(chans.values())))
-    if allon.size == 0:
-        return allon
-    gaps_s = np.diff(allon) / SAMPLE_RATE_HZ
-    starts = np.concatenate([[0], np.where(gaps_s > iti_gap_s)[0] + 1])
-    return allon[starts]
+    Every laser pulse in an experiment, pooled across TTL channels, sorted by onset:
+        onset   int64  rising-edge sample (experiment-local)
+        width   int64  samples until the falling edge (-1 if the file ends high)
+        channel int64  analog channel id (see CHANNEL_WAVELENGTH_NM)
+
+    No refractory period, unlike `laser_onsets`: paired pulses on the *same*
+    laser can be 5 ms apart, and the per-pulse width is needed to check durations.
+    """
+    data, hdr = open_nsx(ns5_path)
+    on, wd, ch = [], [], []
+    for col, chid in enumerate(hdr["channel_ids"]):
+        if chid not in CHANNEL_WAVELENGTH_NM:
+            continue
+        high = np.asarray(data[:, col], dtype=np.int32) > threshold
+        rise = np.flatnonzero(~high[:-1] & high[1:]) + 1
+        fall = np.flatnonzero(high[:-1] & ~high[1:]) + 1
+        fi = np.searchsorted(fall, rise)
+        width = np.where(fi < fall.size, fall[np.minimum(fi, fall.size - 1)] - rise, -1)
+        on.append(rise); wd.append(width); ch.append(np.full(rise.size, chid))
+    onset, width, channel = (np.concatenate(x).astype(np.int64) for x in (on, wd, ch))
+    order = np.argsort(onset, kind="stable")
+    return dict(onset=onset[order], width=width[order], channel=channel[order])
 
 
 def find_ns5(session_dir: Path, exp_num: int, animal_id: str) -> Path | None:

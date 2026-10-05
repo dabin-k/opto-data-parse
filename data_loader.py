@@ -63,12 +63,11 @@ get_population_responses()
 
 Caveats
 -------
-- Onsets are matched to Timeline trials by relative timing; the residual (the
-  small Timeline/Blackrock clock drift) is < ~50 ms and does not affect the
-  onset itself, which comes from the analog TTL.  Some Timeline trials produce
-  no analog TTL (in exp 5, 10 of 30 single_E did), so the number of returned
-  trials can be slightly less than the Timeline trial count; those trials are
-  simply dropped.
+- Trials come from the laser TTLs (when/which laser), grouped by gap with a
+  loud failure on ambiguous gaps, matched to Timeline trials at StimStart + Tp,
+  and checked pulse-by-pulse against their Protocol label
+  (`_experiment_trials`; README "Protocol parameters").  Timeline trials with
+  `Vamp = 0` are no-laser blanks and are never labelled.
 - The trough-to-peak threshold for E/I classification (default 0.4 ms) should
   be validated by inspecting the bimodal waveform-width distribution for each
   session; pass ei_threshold_ms to override.
@@ -360,109 +359,177 @@ def _parse_timeline_trials(timeline_path: Path) -> list[dict]:
     return trials
 
 
-def _match_onsets_to_timeline(
-    onsets: np.ndarray,
-    trials: list[dict],
-    tol_s: float = 1.0,
-) -> list[tuple[int, dict]]:
+# Trial grouping / matching / checking thresholds (README "Protocol parameters").
+# Paper S1.5: 1.6–5 s between trials; within a trial pulses are at most
+# intT + dur1 (≤ ~1 s) apart.  Any pulse gap between the two is ambiguous.
+TRIAL_GAP_MIN_S: float = 1.5
+# Laser onset − (Timeline StimStart + Tp) is constant to ±65 ms (M150605 exp 2);
+# trials are ≥ 1.6 s apart, so 0.25 s is unambiguous.
+MATCH_TOL_S: float = 0.25
+# A trial fails the pulse check if its TTLs disagree with its Protocol label.
+PULSE_INTERVAL_TOL_MS: float = 0.2      # + 0.1 % of the interval (clock drift ~0.05 %)
+PULSE_WIDTH_TOL_MS: float = 0.15        # TTL widths measure 0.97–9.98 ms for 1–10 ms
+# Fail loudly if more than this fraction of an experiment's TTL trials are
+# unlabelled or fail the pulse check — that means a parsing error, not noise.
+MAX_BAD_TRIAL_FRAC: float = 0.05
+
+
+def _group_pulses(onsets: np.ndarray, max_within_s: float, exp_num: int) -> list[np.ndarray]:
     """
-    Match measured laser onsets (Blackrock samples) to Timeline trials.
+    Split an experiment's pulse train into trials (lists of pulse indices).
 
-    The two clocks share the same rate to within negligible drift over one
-    experiment, so a matching analog onset and Timeline trial differ by a
-    constant time shift.  We anchor the first analog onset to whichever of the
-    first few Timeline trials maximises the number of consistent matches (robust
-    to a missing pulse at the start), then assign each onset to its nearest
-    Timeline trial under that shift.
-
-    Returns (onset_sample, trial) pairs, sorted by onset, for onsets that matched
-    a trial within `tol_s`.
+    Every pulse-to-pulse gap must be either ≤ `max_within_s` (same trial) or
+    ≥ TRIAL_GAP_MIN_S (next trial); anything in between raises, since it can't be
+    assigned without guessing.  (A fixed 1.0 s split used to cut 1000 ms pairs in
+    two and align those trials to their *second* pulse.)
     """
-    if onsets.size == 0 or not trials:
-        return []
-
-    a = onsets.astype(np.float64) / SAMPLE_RATE_HZ
-    b = np.array([t["onset_s"] for t in trials], dtype=np.float64)
-
-    best_nearest: np.ndarray | None = None
-    best_resid: np.ndarray | None = None
-    best_score = -1
-    for j0 in range(min(8, b.size)):
-        shift = a[0] - b[j0]
-        nearest = np.abs((b[np.newaxis, :] + shift) - a[:, np.newaxis]).argmin(axis=1)
-        resid = np.abs(b[nearest] + shift - a)
-        score = int(np.sum(resid < tol_s))
-        if score > best_score:
-            best_score, best_nearest, best_resid = score, nearest, resid
-
-    # Assign, keeping the closest onset when two map to the same trial.
-    chosen: dict[int, tuple[int, float]] = {}
-    for i in range(a.size):
-        if best_resid[i] >= tol_s:
-            continue
-        j = int(best_nearest[i])
-        if j not in chosen or best_resid[i] < chosen[j][1]:
-            chosen[j] = (i, float(best_resid[i]))
-
-    matches = [(int(onsets[i]), trials[j]) for j, (i, _) in chosen.items()]
-    matches.sort(key=lambda m: m[0])
-    return matches
+    gaps = np.diff(onsets) / SAMPLE_RATE_HZ
+    between = gaps >= TRIAL_GAP_MIN_S
+    ambiguous = (gaps > max_within_s) & ~between
+    if ambiguous.any():
+        raise ValueError(
+            f"exp {exp_num}: {int(ambiguous.sum())} laser pulse gap(s) of "
+            f"{np.round(gaps[ambiguous][:5], 4).tolist()} s lie between the longest "
+            f"within-trial interval ({max_within_s:.4f} s) and TRIAL_GAP_MIN_S "
+            f"({TRIAL_GAP_MIN_S} s): no clean split into trials")
+    return np.split(np.arange(onsets.size), np.flatnonzero(between) + 1)
 
 
-def _load_experiment_trials(
+def _match_to_timeline(
+    ttl_s: np.ndarray, pred_s: np.ndarray, tol_s: float = MATCH_TOL_S,
+) -> dict[int, int]:
+    """
+    One-to-one match of TTL trial onsets (Blackrock s) to predicted laser times
+    (Timeline StimStart + Tp, Timeline s).  Returns {ttl index: timeline index}.
+
+    The clocks differ by an offset (and a small rate difference), so: anchor on
+    the pair among the first few of each that maximises matches, fit
+    ttl ≈ α·pred + β on those matches, then assign each TTL trial to its nearest
+    prediction within `tol_s`, keeping the closer TTL if two claim one trial.
+    """
+    if ttl_s.size == 0 or pred_s.size == 0:
+        return {}
+
+    def assign(mapped: np.ndarray) -> dict[int, tuple[int, float]]:
+        d = np.abs(ttl_s[:, None] - mapped[None, :])
+        j = d.argmin(axis=1)
+        r = d[np.arange(ttl_s.size), j]
+        out: dict[int, tuple[int, float]] = {}
+        for i in np.flatnonzero(r < tol_s):
+            jj = int(j[i])
+            if jj not in out or r[i] < out[jj][1]:
+                out[jj] = (int(i), float(r[i]))
+        return out
+
+    best: dict[int, tuple[int, float]] = {}
+    for i0 in range(min(8, ttl_s.size)):
+        for j0 in range(min(8, pred_s.size)):
+            m = assign(pred_s + (ttl_s[i0] - pred_s[j0]))
+            if len(m) > len(best):
+                best = m
+    if len(best) >= 2:
+        jj = np.array(list(best))
+        ii = np.array([best[j][0] for j in jj])
+        alpha, beta = np.polyfit(pred_s[jj], ttl_s[ii], 1)
+        best = assign(alpha * pred_s + beta)
+    return {i: j for j, (i, _) in best.items()}
+
+
+def _pulse_check(on: np.ndarray, width: np.ndarray, channel: np.ndarray,
+                 cond: dict) -> str | None:
+    """None if one trial's TTL pulses match its Protocol label, else the reason."""
+    n_expect = 1 if cond["ipi_ms"] == 0 else 2
+    if on.size != n_expect:
+        return f"{on.size} pulses, expected {n_expect}"
+    wl = tuple(laser_timing.CHANNEL_WAVELENGTH_NM[int(c)] for c in channel)
+    if wl != _PULSE_TYPE_WAVELENGTHS[cond["pulse_type"]][:n_expect]:
+        return f"wavelengths {wl}, expected pulseType {cond['pulse_type']}"
+    durs = [cond["dur1_ms"]] + ([cond["dur2_ms"]] if n_expect == 2 else [])
+    w_ms = width / SAMPLE_RATE_HZ * 1000
+    if np.any(np.abs(w_ms - durs) > PULSE_WIDTH_TOL_MS):
+        return f"widths {np.round(w_ms, 2).tolist()} ms, expected {durs}"
+    if n_expect == 2:
+        ipi = (on[1] - on[0]) / SAMPLE_RATE_HZ * 1000
+        if abs(ipi - cond["onset_ipi_ms"]) > PULSE_INTERVAL_TOL_MS + 1e-3 * cond["onset_ipi_ms"]:
+            return f"onset-to-onset {ipi:.2f} ms, expected {cond['onset_ipi_ms']:.2f}"
+    return None
+
+
+def _experiment_trials(
     session_dir: Path,
     exp_num: int,
     animal_id: str,
-    iti_gap_s: float = 1.0,
-) -> list[dict]:
+) -> tuple[list[dict], dict[str, int]]:
     """
-    Trials for one experiment: measured laser onset + condition label.
+    Trials for one experiment, each a laser TTL group matched to its Timeline
+    trial and Protocol condition and checked against it — plus counts:
+        ttl_trials, timeline_laser_trials, labelled,
+        no_ttl          Timeline laser trials with no TTL group (known: some 1 ms
+                        pulses in M150605 exp 5 never produced a TTL)
+        unlabelled      TTL groups with no Timeline trial
+        failed_check    labelled, but TTL pulses disagree with the label (dropped)
 
-    Combines the analog-TTL onsets (timing, Blackrock samples, experiment-local)
-    with the matched Timeline trial and its Protocol condition (labels).  Returns
-    an empty list for experiments with no detectable laser pulses (e.g. visual
-    tuning experiments), which cannot be aligned by this method.
-
-    Each returned dict has:
-        onset_sample : int   experiment-local Blackrock sample of the first pulse
-        exp, block, cond_id
-        pulse_type, ipi_ms, dur_ms, exp_type   (from Protocol)
+    Sources of truth: the TTLs give *when and which laser fired* (same clock as
+    the spikes); Timeline order + Protocol give *what the trial was*.
     """
+    stats = dict(ttl_trials=0, timeline_laser_trials=0, labelled=0,
+                 no_ttl=0, unlabelled=0, failed_check=0)
     ns5 = laser_timing.find_ns5(session_dir, exp_num, animal_id)
-    if ns5 is None:
-        return []
-    onsets = laser_timing.experiment_trial_onsets(ns5, iti_gap_s=iti_gap_s)
-    if onsets.size == 0:
-        return []
-
     timeline_path = session_dir / str(exp_num) / f"1_{exp_num}_{animal_id}_Timeline.mat"
     protocol_path = session_dir / str(exp_num) / "Protocol.mat"
-    if not timeline_path.exists() or not protocol_path.exists():
-        return []
-
-    trials = _parse_timeline_trials(timeline_path)
-    if not trials:
-        return []
+    if ns5 is None or not timeline_path.exists() or not protocol_path.exists():
+        return [], stats
     cond_map = _load_protocol_conditions(protocol_path, _wavelength_to_pop(animal_id))
+    if not cond_map:
+        return [], stats
+    pulses = laser_timing.laser_pulses(ns5)
+    if pulses["onset"].size == 0:
+        return [], stats
+
+    max_within_s = max(c["onset_ipi_ms"] for c in cond_map.values()) / 1000 * 1.01 + 0.002
+    groups = _group_pulses(pulses["onset"], max_within_s, exp_num)
+    laser_tl = [t for t in _parse_timeline_trials(timeline_path) if t["cond_id"] in cond_map]
+    pred_s = np.array([t["onset_s"] + (cond_map[t["cond_id"]]["tp_ms"] or 0) / 1000
+                       for t in laser_tl])
+    ttl_s = np.array([pulses["onset"][g[0]] for g in groups]) / SAMPLE_RATE_HZ
+    match = _match_to_timeline(ttl_s, pred_s)
 
     out: list[dict] = []
-    for onset_sample, trial in _match_onsets_to_timeline(onsets, trials):
-        cond = cond_map.get(trial["cond_id"])
-        if cond is None:
-            continue   # pulse type we don't model
-        out.append(
-            dict(
-                onset_sample=int(onset_sample),
-                exp=int(exp_num),
-                block=trial["block"],
-                cond_id=trial["cond_id"],
-                pulse_type=cond["pulse_type"],
-                ipi_ms=cond["ipi_ms"],
-                dur_ms=cond["dur_ms"],
-                exp_type=cond["exp_type"],
-            )
-        )
-    return out
+    for gi, g in enumerate(groups):
+        if gi not in match:
+            continue
+        tl = laser_tl[match[gi]]
+        cond = cond_map[tl["cond_id"]]
+        reason = _pulse_check(pulses["onset"][g], pulses["width"][g], pulses["channel"][g], cond)
+        if reason is not None:
+            stats["failed_check"] += 1
+            if stats["failed_check"] <= 3:
+                print(f"    exp {exp_num} cond {tl['cond_id']}: pulse check failed — {reason}")
+            continue
+        out.append(dict(onset_sample=int(pulses["onset"][g[0]]), exp=int(exp_num),
+                        block=tl["block"], cond_id=tl["cond_id"], **cond))
+    stats.update(ttl_trials=len(groups), timeline_laser_trials=len(laser_tl),
+                 labelled=len(match), no_ttl=len(laser_tl) - len(match),
+                 unlabelled=len(groups) - len(match))
+    for key in ("unlabelled", "failed_check"):
+        if stats[key] > MAX_BAD_TRIAL_FRAC * len(groups):
+            raise ValueError(f"exp {exp_num}: {stats[key]} of {len(groups)} TTL trials "
+                             f"{key.replace('_', ' ')} (> {MAX_BAD_TRIAL_FRAC:.0%}) — "
+                             f"labels and laser pulses disagree; check the parsing")
+    return out, stats
+
+
+def _load_experiment_trials(session_dir: Path, exp_num: int, animal_id: str) -> list[dict]:
+    """
+    Trials for one experiment (see `_experiment_trials`), each dict:
+        onset_sample : int   experiment-local Blackrock sample of the first pulse
+        exp, block, cond_id
+        + the Protocol condition (`_load_protocol_conditions`): pulse_type, ipi_ms,
+          dur_ms, dur1_ms, dur2_ms, onset_ipi_ms, first_pop, second_pop, exp_type,
+          contrast, tp_ms, seed
+    Empty for experiments with no laser TTLs (e.g. visual tuning experiments).
+    """
+    return _experiment_trials(session_dir, exp_num, animal_id)[0]
 
 
 def _pulse_mask(trial: dict, n_bins: int, pre_s: float, bin_s: float) -> np.ndarray:
@@ -1266,37 +1333,49 @@ def _load_protocol_conditions(
     wl_to_pop: dict[int, str],
 ) -> dict[int, dict]:
     """
-    Parse Protocol.mat and return a mapping:
-        cond_id (1-indexed) → {pulse_type, ipi_ms, dur_ms, first_pop, second_pop, exp_type}
+    Parse Protocol.mat and return a mapping, for conditions that fire a laser:
+        cond_id (1-indexed) → {pulse_type, ipi_ms, dur_ms, dur1_ms, dur2_ms,
+                               onset_ipi_ms, first_pop, second_pop, exp_type,
+                               contrast, tp_ms, seed}
+
+    `ipi_ms` is Protocol `intT`: the gap from the END of pulse 1 to the START of
+    pulse 2 (verified on the laser TTLs, README "Protocol parameters"), so
+    `onset_ipi_ms` = intT + dur1 is the onset-to-onset interval (0 for single).
+
+    `contrast` / `tp_ms` / `seed` are the RandNoise screen-stimulus parameters `c`,
+    `Tp`, `seedw` (README "RandNoise").  Protocols without them
+    (stim2Pulses2Waves) get contrast 0, tp_ms None, seed None.
 
     `wl_to_pop` maps each pulse wavelength to E/I for this animal (see
     `_wavelength_to_pop`).  Returns an empty dict for non-TTL protocols (visual /
-    regular-pulse), which have no `pulseType` parameter.  Conditions whose
-    wavelength drives no opsin in this mouse line are skipped.
+    regular-pulse), which have no `pulseType` parameter.  Skipped: `Vamp == 0`
+    (no laser — blank trials, no TTL) and wavelengths that drive no opsin here.
     """
     mat = scipy.io.loadmat(str(protocol_path), squeeze_me=True, struct_as_record=False)
     p = mat["Protocol"]
     parnames = list(p.parnames)
     if "pulseType" not in parnames:
         return {}
-    pars = p.pars  # (n_params, n_conditions)
+    pars = np.atleast_2d(p.pars)  # (n_params, n_conditions)
 
-    pt_idx = parnames.index("pulseType")
-    int_idx = parnames.index("intT")
+    def col(name: str):
+        return pars[parnames.index(name)] if name in parnames else None
+
     # Duration parameter: either a single `durT` (both pulses equal) or, in the
     # 2Dur variant, per-pulse `durT1`/`durT2` (durations stored as ms*10).
-    if "durT" in parnames:
-        dur1_idx = dur2_idx = parnames.index("durT")
-    else:
-        dur1_idx, dur2_idx = parnames.index("durT1"), parnames.index("durT2")
+    d1_col = col("durT") if "durT" in parnames else col("durT1")
+    d2_col = col("durT") if "durT" in parnames else col("durT2")
+    vamp, c, tp, seed = col("Vamp"), col("c"), col("Tp"), col("seedw")
 
     conditions = {}
     for cond_i in range(p.npfilestimuli):
         cond_id = cond_i + 1   # 1-indexed to match mpepUDP events
-        pt = int(pars[pt_idx, cond_i])
-        ipi_ms = int(pars[int_idx, cond_i])
-        d1 = float(pars[dur1_idx, cond_i]) / 10.0   # stored as ms*10
-        d2 = float(pars[dur2_idx, cond_i]) / 10.0
+        if vamp is not None and vamp[cond_i] <= 0:
+            continue
+        pt = int(col("pulseType")[cond_i])
+        ipi_ms = int(col("intT")[cond_i])
+        d1 = float(d1_col[cond_i]) / 10.0   # stored as ms*10
+        d2 = float(d2_col[cond_i]) / 10.0
         # Single pulse (intT==0): only durT1 is delivered — durT2 is a vestigial
         # default in the 2Dur variant, so drop it.  Paired: keep one value when
         # both durations match, else a (d1, d2) tuple.
@@ -1313,9 +1392,15 @@ def _load_protocol_conditions(
             pulse_type=pt,
             ipi_ms=ipi_ms,
             dur_ms=dur_ms,
+            dur1_ms=d1,
+            dur2_ms=None if ipi_ms == 0 else d2,
+            onset_ipi_ms=0.0 if ipi_ms == 0 else ipi_ms + d1,
             first_pop=pops[0],
             second_pop=pops[1],
             exp_type=_exp_type_key(pt, ipi_ms, wl_to_pop),
+            contrast=0 if c is None else int(c[cond_i]),
+            tp_ms=None if tp is None else int(tp[cond_i]),
+            seed=None if seed is None else int(seed[cond_i]),
         )
     return conditions
 
@@ -1339,6 +1424,12 @@ _OPTO_PULSE_XFILES = {
     # instead of a single durT).  Same E/I single/paired paradigm otherwise.
     "stim2Pulses2DurRandNoise.x",
 }
+
+#: Trial fields that define a condition in `get_trial_counts` (and their sort
+#: order after exp_type).  contrast / tp_ms / seed keep RandNoise screen-stimulus
+#: trials apart from laser-only ones (README "RandNoise").
+_COND_KEY = ("exp_type", "pulse_type", "ipi_ms", "dur1_ms", "dur2_ms",
+             "onset_ipi_ms", "contrast", "tp_ms", "seed")
 
 #: All valid experiment-type keys, in a canonical order.
 ALL_EXP_TYPES = ("single_E", "single_I", "paired_EE", "paired_II",
@@ -1486,14 +1577,18 @@ def _iter_trials(sess: dict, pre_samples: int, post_samples: int):
         complete            False if clipping removed part of the window
 
     Clipping matters because spikes outside an experiment's span belong to the
-    neighbouring experiment in the concatenation, not to this trial.
+    neighbouring experiment in the concatenation, not to this trial.  Per-experiment
+    counts from `_experiment_trials` are left in sess["trial_stats"].
     """
+    sess["trial_stats"] = {}
     for exp_num, exp_start, exp_end in sess["exps"]:
-        trials = _load_experiment_trials(sess["session_dir"], exp_num, sess["animal_id"])
+        trials, stats = _experiment_trials(sess["session_dir"], exp_num, sess["animal_id"])
+        sess["trial_stats"][exp_num] = stats
         if not trials:
             print(f"  exp {exp_num}: no laser trials, skipping")
             continue
-        print(f"  exp {exp_num}: {len(trials)} trials")
+        print(f"  exp {exp_num}: {len(trials)} trials  "
+              + "  ".join(f"{k}={v}" for k, v in stats.items() if k != "labelled"))
         for k, trial in enumerate(trials):
             onset_abs = exp_start + trial["onset_sample"]
             lo, hi = onset_abs - pre_samples, onset_abs + post_samples
@@ -1714,7 +1809,7 @@ def get_trial_counts(
     selected_exps: list[int] | None = None,
     pre_s: float = 0.5,
     post_s: float = 1.5,
-    bin_samples: int = 300,
+    bin_samples: int = 30,
     min_cluster_group: int = 2,
     animal_id: str | None = None,
     box_e: dict | None = None,
@@ -1739,8 +1834,8 @@ def get_trial_counts(
     experiment, so zero-filling would fake silence.  Windows may still contain
     the next trial's pulse if the inter-trial interval is shorter than post_s.
 
-    Parameters as in `get_population_responses`; `bin_samples` defaults to 300
-    (10 ms) and `pre_s` must span a whole number of bins.
+    Parameters as in `get_population_responses`; `bin_samples` defaults to 30
+    (1 ms) and `pre_s` must span a whole number of bins.
 
     Returns
     -------
@@ -1754,18 +1849,27 @@ def get_trial_counts(
         onset_sample  int64  onset, experiment-local 30 kHz sample
 
     Condition table, axis 0 = n_cond, sorted by (exp type, ipi_ms, durations)
-        cond_exp_type    str    'single_E', 'paired_EI', … (see ALL_EXP_TYPES)
-        cond_pulse_type  int64  Protocol pulseType code
-        cond_ipi_ms      int64  inter-pulse interval (0 for single)
-        cond_dur1_ms     float  first-pulse duration
-        cond_dur2_ms     float  second-pulse duration (NaN for single)
-        cond_first_pop   str    'E'/'I' driven by pulse 1
-        cond_second_pop  str    'E'/'I' driven by pulse 2 ('' for single)
+        cond_exp_type     str    'single_E', 'paired_EI', … (see ALL_EXP_TYPES)
+        cond_pulse_type   int64  Protocol pulseType code
+        cond_ipi_ms       int64  Protocol intT: END of pulse 1 → START of pulse 2 (0 = single)
+        cond_onset_ipi_ms float  onset-to-onset interval = intT + dur1 (0 for single)
+        cond_dur1_ms      float  first-pulse duration
+        cond_dur2_ms      float  second-pulse duration (NaN for single)
+        cond_first_pop    str    'E'/'I' driven by pulse 1
+        cond_second_pop   str    'E'/'I' driven by pulse 2 ('' for single)
+        cond_contrast     int64  RandNoise screen-stimulus contrast `c` (0 = laser only;
+                                 also 0 for protocols without it)
+        cond_tp_ms        float  laser onset after StimStart, `Tp` (NaN if absent)
+        cond_seed         float  screen-stimulus seed `seedw` (NaN if absent)
 
     Scalars (0-d) and axes
         time_axis         float64 (n_bins,) bin centres, s relative to onset
         bin_samples, sampling_freq_hz, pre_s, post_s
-        animal_id, session, ei_cache_key, n_trials_dropped
+        animal_id, session, ei_cache_key
+        n_trials_dropped        window crosses an experiment boundary
+        n_trials_no_ttl         Timeline laser trial with no laser TTL
+        n_trials_unlabelled     laser TTL trial with no Timeline trial
+        n_trials_failed_check   TTL pulses disagree with the Protocol label
     """
     sess = _load_session(base_dir, session, animal_id, selected_exps,
                          min_cluster_group, box_e, box_i)
@@ -1782,7 +1886,7 @@ def get_trial_counts(
         rows.append(dict(
             counts=_bin_trial(sess, t["onset_abs"], t["win_start"], t["win_end"],
                               pre_samples, bin_samples, n_bins),
-            ckey=(tr["exp_type"], tr["pulse_type"], tr["ipi_ms"], tr["dur_ms"]),
+            ckey=tuple(tr[k] for k in _COND_KEY),
             exp_num=t["exp_num"], trial_in_exp=t["trial_in_exp"],
             onset_sample=tr["onset_sample"],
         ))
@@ -1792,29 +1896,27 @@ def get_trial_counts(
     if not rows:
         return {}
 
-    # dur_ms is a scalar, or a (d1, d2) tuple when paired durations differ;
-    # normalise to a tuple so mixed keys sort.
-    def _durs(dur) -> tuple:
-        return tuple(dur) if isinstance(dur, tuple) else (dur,)
-
+    # None marks "not in this protocol" (dur2 of a single, Tp/seed of Waves).
     cond_keys = sorted({r["ckey"] for r in rows},
-                       key=lambda k: (ALL_EXP_TYPES.index(k[0]), k[2], _durs(k[3])))
+                       key=lambda k: (ALL_EXP_TYPES.index(k[0]),
+                                      *(-1 if v is None else v for v in k[1:])))
     cond_lookup = {k: i for i, k in enumerate(cond_keys)}
+    cols = {name: [k[i] for k in cond_keys] for i, name in enumerate(_COND_KEY)}
+    nan_none = lambda vals: np.array([np.nan if v is None else v for v in vals], dtype=np.float64)
 
     counts = np.stack([r["counts"] for r in rows])
     if counts.max() > np.iinfo(np.uint16).max:
         raise ValueError(f"bin count {counts.max()} overflows uint16; "
                          f"bin_samples = {bin_samples} is too wide")
 
-    dur1, dur2, first, second = [], [], [], []
-    for exp_type, pt, ipi, dur in cond_keys:
-        d = _durs(dur)
+    first, second = [], []
+    for pt, ipi in zip(cols["pulse_type"], cols["ipi_ms"]):
         pops = _pulse_populations(pt, wl_to_pop)
-        dur1.append(d[0])
         first.append(pops[0])
         # Single pulse (ipi 0): only one pulse is delivered, so no second pulse.
-        dur2.append(np.nan if ipi == 0 else d[-1])
         second.append("" if ipi == 0 else pops[1])
+    totals = {k: sum(st[k] for st in sess["trial_stats"].values())
+              for k in ("no_ttl", "unlabelled", "failed_check")}
 
     return dict(
         counts=counts.astype(np.uint16),
@@ -1822,13 +1924,17 @@ def get_trial_counts(
         exp_num=np.array([r["exp_num"] for r in rows], dtype=np.int64),
         trial_in_exp=np.array([r["trial_in_exp"] for r in rows], dtype=np.int64),
         onset_sample=np.array([r["onset_sample"] for r in rows], dtype=np.int64),
-        cond_exp_type=np.array([k[0] for k in cond_keys]),
-        cond_pulse_type=np.array([k[1] for k in cond_keys], dtype=np.int64),
-        cond_ipi_ms=np.array([k[2] for k in cond_keys], dtype=np.int64),
-        cond_dur1_ms=np.array(dur1, dtype=np.float64),
-        cond_dur2_ms=np.array(dur2, dtype=np.float64),
+        cond_exp_type=np.array(cols["exp_type"]),
+        cond_pulse_type=np.array(cols["pulse_type"], dtype=np.int64),
+        cond_ipi_ms=np.array(cols["ipi_ms"], dtype=np.int64),
+        cond_onset_ipi_ms=np.array(cols["onset_ipi_ms"], dtype=np.float64),
+        cond_dur1_ms=np.array(cols["dur1_ms"], dtype=np.float64),
+        cond_dur2_ms=nan_none(cols["dur2_ms"]),
         cond_first_pop=np.array(first),
         cond_second_pop=np.array(second),
+        cond_contrast=np.array(cols["contrast"], dtype=np.int64),
+        cond_tp_ms=nan_none(cols["tp_ms"]),
+        cond_seed=nan_none(cols["seed"]),
         time_axis=time_axis,
         bin_samples=np.array(bin_samples),
         sampling_freq_hz=np.array(SAMPLE_RATE_HZ),
@@ -1838,6 +1944,9 @@ def get_trial_counts(
         session=np.array(sess["session"]),
         ei_cache_key=np.array(sess["ei_cache_key"]),
         n_trials_dropped=np.array(n_dropped),
+        n_trials_no_ttl=np.array(totals["no_ttl"]),
+        n_trials_failed_check=np.array(totals["failed_check"]),
+        n_trials_unlabelled=np.array(totals["unlabelled"]),
     )
 
 

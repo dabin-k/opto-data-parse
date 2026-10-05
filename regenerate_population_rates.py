@@ -6,7 +6,8 @@ Each file is one session's flat trial table (layout in DATA.md): raw E/I
 population spike counts per trial, `counts (n_trials, 2, n_bins)`, plus
 per-trial and per-condition arrays linked by `cond_idx`.  No averaging,
 smoothing, baseline normalisation or cross-validation folding happens here —
-those are downstream choices (see tutorial.ipynb).
+those are downstream choices (see tutorial.ipynb, trial_analysis.py).  Time
+is only binned: each bin holds a spike count.
 
 Every hyperparameter that shapes the output is set below; the values are also
 stamped into each file.
@@ -28,9 +29,10 @@ OUT_DIR = Path(__file__).parent / "results"
 PRE_S = 0.5
 POST_S = 1.5
 # Bin width in sampling intervals of the 30 kHz recording clock
-# (data_loader.SAMPLE_RATE_HZ), so 300 = 10 ms.  Must divide PRE_S * 30 000 so
-# that onset is a bin edge.
-BIN_SAMPLES = 300
+# (data_loader.SAMPLE_RATE_HZ), so 30 = 1 ms.  Each bin holds a spike *count*
+# (no averaging); coarser bins are an exact sum downstream
+# (trial_analysis.rebin).  Must divide PRE_S * 30 000 so onset is a bin edge.
+BIN_SAMPLES = 30
 # Neighbour pool for the clusterless E/I split: 2 = good clusters only (see
 # data_loader.get_population_responses).  Stamped via `ei_cache_key`.
 MIN_CLUSTER_GROUP = 2
@@ -46,7 +48,8 @@ def regenerate(animal_id: str) -> None:
         print(f"SKIP {animal_id}: no laser trials — nothing written.", flush=True)
         return
     out_path = OUT_DIR / f"trial_counts_b{BIN_SAMPLES}_{animal_id}_s{SESSION}.npz"
-    np.savez(out_path, **out)
+    # Compressed: 1 ms count arrays are mostly zeros.  np.load reads it unchanged.
+    np.savez_compressed(out_path, **out)
     print(f"wrote {out_path}  ({out['counts'].shape[0]} trials, "
           f"{out['cond_exp_type'].size} conditions, "
           f"{int(out['n_trials_dropped'])} dropped, n_bins={out['time_axis'].size})",
