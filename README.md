@@ -151,7 +151,7 @@ through it, so nothing else changes.
 
 Checked on 2 mice so far: **M150605A** and **M150609A** (both `M15060x_ICTP1`). Not yet verified on the rest.
 
-**Never parse `M150909C`, `M150823B`, `M150303B`.** The legacy population-rates pipeline hard-coded 3-fold cross-validation (paper S1.10), but these three sessions used a different number of folds (paper p22), so they were excluded. *Open:* the single-trial files no longer bake in folds, so this reason no longer applies — revisit whether to include them.
+M150909C, M150823B and M150303B used a different number of CV folds in the paper (Table S3, k = 2). Folds are chosen downstream, so these sessions are parsed like any other (`M150823_ICTP2` = M150823B).
 
 Same across both (promising, unverified elsewhere):
 - `.ns5` = 36 ch = 32 neural + 4 analog (ids 129–132), **NEURALSG** format.
